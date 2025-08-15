@@ -4,12 +4,20 @@ build-backend = "maturin"
 
 [project]
 name = "dockerfile-analyzer"
-requires-python = ">=3.8"
+description = "Analyzes Dockerfiles and provides comprehensive insights including stage information, base images, multistage build analysis, instruction statistics, environment variables, labels, arguments, and exposed ports."
+requires-python = ">=3.13"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
 dynamic = ["version"]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
+[project.urls]
+Homepage = "https://github.com/societymartingale/dockerfile-analyzer"
+Issues = "https://github.com/societymartingale/dockerfile-analyzer/issues"
