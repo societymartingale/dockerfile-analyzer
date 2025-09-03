@@ -26,7 +26,7 @@ impl InstructionStats {
         )
     }
 
-    fn to_dict(&self, py: Python) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("total_count", self.total_count)?;
         dict.set_item("by_type", &self.by_type)?;
@@ -64,7 +64,7 @@ impl ImageComponents {
         )
     }
 
-    fn to_dict(&self, py: Python) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("registry", &self.registry)?;
         dict.set_item("name", &self.name)?;
@@ -102,7 +102,7 @@ impl Image {
         )
     }
 
-    fn to_dict(&self, py: Python) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("full", &self.full)?;
 
@@ -148,7 +148,7 @@ impl MultistageAnalysis {
         )
     }
 
-    fn to_dict(&self, py: Python) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("is_multistage", self.is_multistage)?;
         dict.set_item(
@@ -215,12 +215,12 @@ impl Analysis {
         )
     }
 
-    fn to_dict(&self, py: Python) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("num_stages", self.num_stages)?;
 
         // Convert Vec<Image> to Vec<PyObject>
-        let images: PyResult<Vec<PyObject>> =
+        let images: PyResult<Vec<Py<PyAny>>> =
             self.images.iter().map(|img| img.to_dict(py)).collect();
         dict.set_item("images", images?)?;
 
@@ -259,7 +259,7 @@ impl KeyValueInstr {
         )
     }
 
-    fn to_dict(&self, py: Python) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("args", &self.args)?;
         dict.set_item("labels", &self.labels)?;
