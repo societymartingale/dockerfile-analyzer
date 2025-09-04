@@ -49,9 +49,9 @@ fn extract_tokens_from_instr(ins: &str) -> Vec<String> {
     processed
 }
 
-fn vec_to_map(v: &[String]) -> HashMap<String, String> {
+fn vec_to_map(toks: &[String]) -> HashMap<String, String> {
     let mut res = HashMap::new();
-    for chunk in v.chunks(2) {
+    for chunk in toks.chunks(2) {
         match chunk {
             [k, v] => {
                 res.insert(k.to_string(), v.to_string());
@@ -66,9 +66,9 @@ fn vec_to_map(v: &[String]) -> HashMap<String, String> {
     res
 }
 
-fn vec_to_map_opt_val(v: &[String]) -> HashMap<String, Option<String>> {
+fn vec_to_map_opt_val(toks: &[String]) -> HashMap<String, Option<String>> {
     let mut res: HashMap<String, Option<String>> = HashMap::new();
-    for chunk in v.chunks(2) {
+    for chunk in toks.chunks(2) {
         match chunk {
             [k, v] => {
                 res.insert(k.to_string(), Some(v.to_string()));
