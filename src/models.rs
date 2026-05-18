@@ -3,7 +3,7 @@ use pyo3::types::PyDict;
 use serde::Serialize;
 use std::collections::HashMap;
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[doc = "Instructions and their counts.
 
 This class contains all instructions found in the Dockerfile along with their 
@@ -34,7 +34,7 @@ impl InstructionStats {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[doc = "Parsed components of a Docker image reference.
 
 Attributes:
@@ -74,7 +74,7 @@ impl ImageComponents {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[doc = "Information about a Docker image used in a Dockerfile.
 
 Attributes:
@@ -115,7 +115,7 @@ impl Image {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[doc = "Information about multistage characteristics.
 
 This class contains an is_multistage bool along with information
@@ -162,7 +162,7 @@ impl MultistageAnalysis {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[doc = "Represents comprehensive analysis results of a Dockerfile.
 
 This class contains all the extracted information from a Dockerfile including
@@ -237,7 +237,7 @@ impl Analysis {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[doc = "Key/Value Pairs found in ARG, ENV, and LABEL instructions.
 "]
 #[derive(Debug, PartialEq, Clone, Serialize)]

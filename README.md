@@ -273,3 +273,13 @@ Analysis(num_stages=4, images=[Image(full="builder", components="ImageComponents
   }
 }
 ```
+
+## Developing
+
+```sh
+python3 -m venv env
+source env/bin/activate
+pip install -r requirements-dev.txt
+cargo test
+maturin develop
+```
