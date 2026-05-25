@@ -11,6 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = "0.28.3"
 docker-image = {version = "0.2.1"}
-parse-dockerfile = { version = "0.1.5", default-features = false }
+parse-dockerfile = { version = "0.1.6", default-features = false }
 shlex = "2.0.1"
 serde = { version = "1.0.228", features = ["derive"] }
