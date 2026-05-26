@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "dockerfile-analyzer"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "docker-image",
  "parse-dockerfile",
@@ -49,9 +49,9 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "parse-dockerfile"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "305044570a32b05015d7ce29299a49e1a7734638e57bc5abb3953dcdc1800cfc"
+checksum = "01f0f9e6a20d87f256298bea33415f39898aa3f94f4e0989e7d4345d6ecef801"
 dependencies = [
  "smallvec",
 ]
