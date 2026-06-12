@@ -9,7 +9,7 @@ name = "dockerfile_analyzer"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = "0.28.3"
+pyo3 = "0.29.0"
 docker-image = {version = "0.2.1"}
 parse-dockerfile = { version = "0.1.7", default-features = false }
 shlex = "2.0.1"
