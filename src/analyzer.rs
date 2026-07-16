@@ -983,7 +983,10 @@ COPY --from=base /usr/bin/curl /usr/bin/curl
             let res = analyze_dockerfile(dockerfile);
             assert!(res.is_err());
             let err_text = res.unwrap_err().to_string();
-            assert!(err_text.contains("duplicate name 'base'"));
+            assert!(
+                err_text.contains("duplicate stage name 'base'"),
+                "unexpected error: {err_text}"
+            );
         }
 
         #[test]
