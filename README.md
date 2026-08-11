@@ -280,6 +280,9 @@ Analysis(num_stages=4, images=[Image(full="builder", components="ImageComponents
 python3 -m venv env
 source env/bin/activate
 pip install -r requirements-dev.txt
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 maturin develop
+pytest
 ```
