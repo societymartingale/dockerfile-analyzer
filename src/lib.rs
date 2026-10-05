@@ -12,13 +12,15 @@ Args:
     dockerfile_content (str): The content of the Dockerfile to analyze
 
 Returns:
-    Analysis: A comprehensive analysis object containing information about:
-        - Number of stages and stage names
-        - Base images used
-        - Multistage analysis (if applicable)
-        - Instructions statistics
-        - Environment variables, labels, and arguments
-        - Exposed ports
+    Analysis: Stages, images, instruction counts, ARG/ENV/LABEL values, and
+    exposed ports. `COPY --from` and `ADD --from` indexes are resolved to
+    stages. External `--from` images are returned separately from stage names.
+
+    Image references that do not contain a variable are lowercased.
+    `${VAR}` and `$VAR` are not expanded. `EXPOSE` values are raw tokens,
+    including protocol suffixes and ranges. `stage_names` lists named stages
+    only; `final_stage` is the last stage name, or None when it is unnamed.
+    A later `ARG NAME` without a value keeps an earlier default.
 
 Raises:
     ValueError: If the dockerfile content is empty or invalid

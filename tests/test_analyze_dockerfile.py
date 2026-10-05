@@ -18,8 +18,11 @@ def test_analyze_multistage_dockerfile():
 
     assert analysis.num_stages == 3
     assert analysis.stage_names == ["base", "test"]
+    assert analysis.final_stage is None
     assert analysis.copy_from_stages == []
     assert analysis.add_from_stages == []
+    assert analysis.copy_from_images == []
+    assert analysis.add_from_images == []
     assert analysis.exposed_ports == ["5000"]
 
     assert analysis.multistage_analysis.is_multistage is True
@@ -86,6 +89,9 @@ def test_analyze_multistage_to_dict():
 
     assert data["num_stages"] == 3
     assert data["stage_names"] == ["base", "test"]
+    assert data["final_stage"] is None
+    assert data["copy_from_images"] == []
+    assert data["add_from_images"] == []
     assert data["exposed_ports"] == ["5000"]
     assert data["multistage_analysis"]["is_multistage"] is True
     assert data["multistage_analysis"]["unused_stages"] == ["test"]
@@ -109,6 +115,7 @@ CMD ["npm", "start"]
 
     assert analysis.num_stages == 1
     assert analysis.stage_names == []
+    assert analysis.final_stage is None
     assert analysis.multistage_analysis.is_multistage is False
     assert analysis.exposed_ports == ["3000"]
     assert analysis.instructions.by_type["FROM"] == 1
@@ -127,3 +134,64 @@ def test_analyze_invalid_dockerfile_raises():
 def test_analyze_empty_dockerfile_raises():
     with pytest.raises(ValueError):
         da.analyze_dockerfile("")
+
+
+def test_numeric_from_resolves_to_stage_name():
+    dockerfile = """\
+FROM alpine AS base
+FROM scratch
+COPY --from=0 /etc/os-release /
+"""
+    analysis = da.analyze_dockerfile(dockerfile)
+
+    assert analysis.multistage_analysis.is_multistage is True
+    assert analysis.copy_from_stages == ["base"]
+    assert analysis.multistage_analysis.unused_stages == []
+    assert analysis.copy_from_images == []
+    assert analysis.final_stage is None
+
+
+def test_external_copy_from_is_an_image():
+    dockerfile = """\
+FROM alpine
+COPY --from=nginx:1.25 /etc/nginx /etc/nginx
+"""
+    analysis = da.analyze_dockerfile(dockerfile)
+
+    assert analysis.copy_from_stages == []
+    assert analysis.multistage_analysis.is_multistage is False
+    assert len(analysis.copy_from_images) == 1
+    image = analysis.copy_from_images[0]
+    assert image.full == "nginx:1.25"
+    assert image.components is not None
+    assert image.components.name == "nginx"
+    assert image.components.tag == "1.25"
+
+
+def test_arg_redeclaration_keeps_earlier_default():
+    dockerfile = """\
+ARG VERSION=1
+FROM alpine:${VERSION}
+ARG VERSION
+"""
+    analysis = da.analyze_dockerfile(dockerfile)
+    assert analysis.args == {"VERSION": "1"}
+    assert analysis.images[0].components is None
+
+
+def test_short_digest_still_has_components():
+    analysis = da.analyze_dockerfile("FROM python:3.12-slim@sha256:abcdef\n")
+    components = analysis.images[0].components
+    assert components is not None
+    assert components.name == "python"
+    assert components.tag == "3.12-slim"
+    assert components.digest == "sha256:abcdef"
+
+
+def test_repr_renders_python_none():
+    analysis = da.analyze_dockerfile("FROM alpine\nARG VERSION\n")
+    rendered = repr(analysis)
+    assert "final_stage=None" in rendered
+    assert '"VERSION": None' in rendered
+    assert "Some(" not in rendered
+    assert 'components="ImageComponents' not in rendered

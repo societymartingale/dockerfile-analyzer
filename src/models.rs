@@ -1,20 +1,36 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-#[pyclass(from_py_object)]
+fn fmt_opt(value: &Option<String>) -> String {
+    match value {
+        Some(text) => format!("{text:?}"),
+        None => "None".to_string(),
+    }
+}
+
+fn fmt_opt_map(map: &BTreeMap<String, Option<String>>) -> String {
+    let body = map
+        .iter()
+        .map(|(key, value)| format!("{key:?}: {}", fmt_opt(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{body}}}")
+}
+
+#[pyclass(skip_from_py_object)]
 #[doc = "Instructions and their counts.
 
-This class contains all instructions found in the Dockerfile along with their 
-counts. It also incudes the total count.
+Counts are keyed by the Dockerfile instruction name (`FROM`, `RUN`, ...).
+`by_type` is sorted by instruction name. A future instruction the parser does
+not yet model is counted as `UNKNOWN` rather than an empty key.
 "]
-#[derive(Debug, PartialEq, Clone, Serialize)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct InstructionStats {
     #[pyo3(get)]
     pub total_count: u32,
     #[pyo3(get)]
-    pub by_type: HashMap<String, u32>,
+    pub by_type: BTreeMap<String, u32>,
 }
 
 #[pymethods]
@@ -34,16 +50,16 @@ impl InstructionStats {
     }
 }
 
-#[pyclass(from_py_object)]
+#[pyclass(skip_from_py_object)]
 #[doc = "Parsed components of a Docker image reference.
 
 Attributes:
     registry (str | None): The registry hostname (e.g., 'docker.io')
     name (str): The image name (e.g., 'ubuntu')
     tag (str | None): The image tag (e.g., '20.04')
-    digest (str | None): The image digest if specified
+    digest (str | None): The image digest if specified, including short digests
 "]
-#[derive(Debug, PartialEq, Clone, Serialize)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ImageComponents {
     #[pyo3(get)]
     pub registry: Option<String>,
@@ -59,8 +75,11 @@ pub struct ImageComponents {
 impl ImageComponents {
     fn __repr__(&self) -> String {
         format!(
-            "ImageComponents(registry={:?}, name={:?}, tag={:?}, digest={:?})",
-            self.registry, self.name, self.tag, self.digest
+            "ImageComponents(registry={}, name={:?}, tag={}, digest={})",
+            fmt_opt(&self.registry),
+            self.name,
+            fmt_opt(&self.tag),
+            fmt_opt(&self.digest)
         )
     }
 
@@ -74,14 +93,15 @@ impl ImageComponents {
     }
 }
 
-#[pyclass(from_py_object)]
+#[pyclass(skip_from_py_object)]
 #[doc = "Information about a Docker image used in a Dockerfile.
 
 Attributes:
-    full (str): The complete image reference as it appears in the Dockerfile
-    components (ImageComponents | None): Parsed components of the image reference
+    full (str): The image reference. Non-variable references are lowercased.
+    components (ImageComponents | None): Parsed components, or None when the
+        reference contains an unexpanded variable.
 "]
-#[derive(Debug, PartialEq, Clone, Serialize)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Image {
     #[pyo3(get)]
     pub full: String,
@@ -92,22 +112,18 @@ pub struct Image {
 #[pymethods]
 impl Image {
     fn __repr__(&self) -> String {
-        format!(
-            "Image(full={:?}, components={:?})",
-            self.full,
-            match &self.components {
-                Some(comp) => comp.__repr__().to_string(),
-                None => "None".to_string(),
-            }
-        )
+        let components = match &self.components {
+            Some(components) => components.__repr__(),
+            None => "None".to_string(),
+        };
+        format!("Image(full={:?}, components={components})", self.full)
     }
 
     fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("full", &self.full)?;
-
         let components = match &self.components {
-            Some(comp) => Some(comp.to_dict(py)?),
+            Some(components) => Some(components.to_dict(py)?),
             None => None,
         };
         dict.set_item("components", components)?;
@@ -115,13 +131,16 @@ impl Image {
     }
 }
 
-#[pyclass(from_py_object)]
-#[doc = "Information about multistage characteristics.
+#[pyclass(skip_from_py_object)]
+#[doc = "How named stages are referenced by later instructions.
 
-This class contains an is_multistage bool along with information
-about specific stages in the Dockerfile.
+`is_multistage` is true when the Dockerfile has at least two stages and a
+later instruction uses an earlier stage as a base image or as a COPY/ADD
+`--from` source. An index such as `--from=0` counts. An unused named stage is
+one that no later instruction references. The final stage is often unused in
+that sense: it is the image the build produces.
 "]
-#[derive(Debug, PartialEq, Clone, Serialize)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct MultistageAnalysis {
     #[pyo3(get)]
     pub is_multistage: bool,
@@ -162,13 +181,26 @@ impl MultistageAnalysis {
     }
 }
 
-#[pyclass(from_py_object)]
-#[doc = "Represents comprehensive analysis results of a Dockerfile.
+#[pyclass(skip_from_py_object)]
+#[doc = "Analysis of one Dockerfile.
 
-This class contains all the extracted information from a Dockerfile including
-stages, images, instructions, environment variables, and multistage analysis.
+Image references that do not contain `$` are lowercased, so `Ubuntu:22.04`
+and `ubuntu:22.04` are one image. References that contain `$` are not
+expanded. A reference whose first character is `$` has `components` set to
+None; other unresolved references also have `components` set to None. `EXPOSE` values are raw tokens,
+including protocol suffixes and ranges.
+
+`stage_names` lists only stages with an `AS` name, sorted. `final_stage` is
+the last stage's name, or None when that stage is unnamed. An unnamed stage
+cannot be referenced by name. When `COPY --from` or `ADD --from` uses an
+in-range index of an unnamed stage, the index is reported in place of a name.
+
+`images` contains `FROM` images. External `COPY --from` and `ADD --from`
+images are `copy_from_images` and `add_from_images`. A `--from` value that
+names a stage, or an in-range stage index, is a stage reference rather than
+an image.
 "]
-#[derive(Debug, PartialEq, Clone, Serialize)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Analysis {
     #[pyo3(get)]
     pub num_stages: usize,
@@ -177,9 +209,15 @@ pub struct Analysis {
     #[pyo3(get)]
     pub stage_names: Vec<String>,
     #[pyo3(get)]
+    pub final_stage: Option<String>,
+    #[pyo3(get)]
     pub copy_from_stages: Vec<String>,
     #[pyo3(get)]
     pub add_from_stages: Vec<String>,
+    #[pyo3(get)]
+    pub copy_from_images: Vec<Image>,
+    #[pyo3(get)]
+    pub add_from_images: Vec<Image>,
     #[pyo3(get)]
     pub multistage_analysis: MultistageAnalysis,
     #[pyo3(get)]
@@ -187,29 +225,36 @@ pub struct Analysis {
     #[pyo3(get)]
     pub instructions: InstructionStats,
     #[pyo3(get)]
-    pub args: HashMap<String, Option<String>>,
+    pub args: BTreeMap<String, Option<String>>,
     #[pyo3(get)]
-    pub labels: HashMap<String, String>,
+    pub labels: BTreeMap<String, String>,
     #[pyo3(get)]
-    pub env_vars: HashMap<String, String>,
+    pub env_vars: BTreeMap<String, String>,
+}
+
+impl Analysis {
+    pub fn repr(&self) -> String {
+        self.__repr__()
+    }
 }
 
 #[pymethods]
 impl Analysis {
     fn __repr__(&self) -> String {
-        let images_repr: Vec<String> = self.images.iter().map(|img| img.__repr__()).collect();
-
+        let images = join_images(&self.images);
+        let copy_from_images = join_images(&self.copy_from_images);
+        let add_from_images = join_images(&self.add_from_images);
         format!(
-            "Analysis(num_stages={}, images=[{}], stage_names={:?}, copy_from_stages={:?}, add_from_stages={:?}, multistage_analysis={}, exposed_ports={:?}, instructions={}, args={:?}, labels={:?}, env_vars={:?})",
+            "Analysis(num_stages={}, images=[{images}], stage_names={:?}, final_stage={}, copy_from_stages={:?}, add_from_stages={:?}, copy_from_images=[{copy_from_images}], add_from_images=[{add_from_images}], multistage_analysis={}, exposed_ports={:?}, instructions={}, args={}, labels={:?}, env_vars={:?})",
             self.num_stages,
-            images_repr.join(", "),
             self.stage_names,
+            fmt_opt(&self.final_stage),
             self.copy_from_stages,
             self.add_from_stages,
             self.multistage_analysis.__repr__(),
             self.exposed_ports,
             self.instructions.__repr__(),
-            self.args,
+            fmt_opt_map(&self.args),
             self.labels,
             self.env_vars
         )
@@ -218,15 +263,19 @@ impl Analysis {
     fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("num_stages", self.num_stages)?;
-
-        // Convert Vec<Image> to Vec<PyObject>
-        let images: PyResult<Vec<Py<PyAny>>> =
-            self.images.iter().map(|img| img.to_dict(py)).collect();
-        dict.set_item("images", images?)?;
-
+        dict.set_item("images", images_to_dicts(py, &self.images)?)?;
         dict.set_item("stage_names", &self.stage_names)?;
+        dict.set_item("final_stage", &self.final_stage)?;
         dict.set_item("copy_from_stages", &self.copy_from_stages)?;
         dict.set_item("add_from_stages", &self.add_from_stages)?;
+        dict.set_item(
+            "copy_from_images",
+            images_to_dicts(py, &self.copy_from_images)?,
+        )?;
+        dict.set_item(
+            "add_from_images",
+            images_to_dicts(py, &self.add_from_images)?,
+        )?;
         dict.set_item("multistage_analysis", self.multistage_analysis.to_dict(py)?)?;
         dict.set_item("exposed_ports", &self.exposed_ports)?;
         dict.set_item("instructions", self.instructions.to_dict(py)?)?;
@@ -237,33 +286,14 @@ impl Analysis {
     }
 }
 
-#[pyclass(from_py_object)]
-#[doc = "Key/Value Pairs found in ARG, ENV, and LABEL instructions.
-"]
-#[derive(Debug, PartialEq, Clone, Serialize)]
-pub struct KeyValueInstr {
-    #[pyo3(get)]
-    pub args: HashMap<String, Option<String>>,
-    #[pyo3(get)]
-    pub labels: HashMap<String, String>,
-    #[pyo3(get)]
-    pub env_vars: HashMap<String, String>,
+fn join_images(images: &[Image]) -> String {
+    images
+        .iter()
+        .map(Image::__repr__)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-#[pymethods]
-impl KeyValueInstr {
-    fn __repr__(&self) -> String {
-        format!(
-            "KeyValueInstr(args={:?}, labels={:?}, env_vars={:?})",
-            self.args, self.labels, self.env_vars
-        )
-    }
-
-    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("args", &self.args)?;
-        dict.set_item("labels", &self.labels)?;
-        dict.set_item("env_vars", &self.env_vars)?;
-        Ok(dict.into())
-    }
+fn images_to_dicts(py: Python, images: &[Image]) -> PyResult<Vec<Py<PyAny>>> {
+    images.iter().map(|image| image.to_dict(py)).collect()
 }

@@ -37,6 +37,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+        env:
+          # setup-python's interpreter is not always `python3` on PATH.
+          PYO3_PYTHON: python
 
   test:
     name: cargo test
@@ -52,6 +55,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: cargo test
+        env:
+          # setup-python's interpreter is not always `python3` on PATH.
+          PYO3_PYTHON: python
 
   python-test:
     name: python test

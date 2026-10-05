@@ -1,0 +1,7 @@
+# PyO3 links test and clippy binaries against the interpreter it discovers.
+# `python3` on this machine is 3.12 without libpython3.12.so on the default
+# linker path, so `cargo test` fails with "unable to find library -lpython3.12".
+# Point Cargo at the project virtualenv. CI sets PYO3_PYTHON itself, which
+# overrides this.
+[env]
+PYO3_PYTHON = { value = "env/bin/python", relative = true }
