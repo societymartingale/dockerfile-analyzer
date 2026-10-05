@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "dockerfile-analyzer"
-version = "0.3.23"
+version = "0.3.24"
 dependencies = [
  "docker-image",
  "parse-dockerfile",
