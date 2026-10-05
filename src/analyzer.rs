@@ -1,43 +1,68 @@
-// This logic does not handle numeric stages such as "COPY --from=1".
-// Dockerfiles should now use named stages rather than numeric stages.
-
 use crate::constants;
 use crate::models;
-use crate::models::KeyValueInstr;
 use crate::parse_utils;
 use docker_image::DockerImage;
-use parse_dockerfile::{AddInstruction, CopyInstruction, Instruction, Stage, parse};
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use parse_dockerfile::{Flag, Instruction, Stage, parse};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
-trait HasOptions {
-    fn options(&self) -> &[parse_dockerfile::Flag<'_>];
+struct StageInfo {
+    images: BTreeSet<String>,
+    stage_names: BTreeSet<String>,
+    /// `AS` name of each stage, in Dockerfile order. `None` when the stage is unnamed.
+    ordered_names: Vec<Option<String>>,
 }
 
-impl HasOptions for CopyInstruction<'_> {
-    fn options(&self) -> &[parse_dockerfile::Flag<'_>] {
-        &self.options
-    }
+struct InstructionFacts {
+    copy_from_stages: BTreeSet<String>,
+    add_from_stages: BTreeSet<String>,
+    copy_from_images: BTreeMap<String, models::Image>,
+    add_from_images: BTreeMap<String, models::Image>,
+    exposed_ports: BTreeSet<String>,
+    by_type: BTreeMap<String, u32>,
+    total_count: u32,
+    args: BTreeMap<String, Option<String>>,
+    labels: BTreeMap<String, String>,
+    env_vars: BTreeMap<String, String>,
 }
 
-impl HasOptions for AddInstruction<'_> {
-    fn options(&self) -> &[parse_dockerfile::Flag<'_>] {
-        &self.options
-    }
+enum FromTarget {
+    Stage(String),
+    Image(String),
 }
 
-fn get_from_flag_val<T: HasOptions>(instruction: &T) -> Option<String> {
-    for flag in instruction.options() {
-        let flag_name = &flag.name.value;
-        let flag_val = flag.value.as_ref().map(|v| &v.value);
-        if flag_name.as_ref() == constants::FROM
-            && let Some(from_value) = flag_val
-        {
-            return Some(from_value.to_string());
-        }
-    }
-    None
+pub fn analyze_dockerfile(body: &str) -> Result<models::Analysis, Box<dyn Error>> {
+    let dockerfile = parse(body)?;
+    let stages: Vec<_> = dockerfile.stages().collect();
+    let stage_info = extract_stage_info(&stages);
+    let facts = collect_instructions(&dockerfile.instructions, &stage_info.ordered_names);
+    let multistage_analysis = analyze_multistage(
+        stages.len(),
+        &stage_info.images,
+        &stage_info.stage_names,
+        &facts.copy_from_stages,
+        &facts.add_from_stages,
+    );
+
+    Ok(models::Analysis {
+        num_stages: stages.len(),
+        images: parse_images(&stage_info.images),
+        stage_names: stage_info.stage_names.into_iter().collect(),
+        final_stage: stage_info.ordered_names.last().cloned().flatten(),
+        copy_from_stages: facts.copy_from_stages.into_iter().collect(),
+        add_from_stages: facts.add_from_stages.into_iter().collect(),
+        copy_from_images: facts.copy_from_images.into_values().collect(),
+        add_from_images: facts.add_from_images.into_values().collect(),
+        multistage_analysis,
+        exposed_ports: facts.exposed_ports.into_iter().collect(),
+        instructions: models::InstructionStats {
+            total_count: facts.total_count,
+            by_type: facts.by_type,
+        },
+        args: facts.args,
+        labels: facts.labels,
+        env_vars: facts.env_vars,
+    })
 }
 
 fn analyze_multistage(
@@ -50,216 +75,376 @@ fn analyze_multistage(
     let stages_used_as_base_images: BTreeSet<String> =
         stage_names.intersection(images).cloned().collect();
 
-    let stages_copied_from: BTreeSet<String> = stage_names
-        .intersection(copy_from_stages)
-        .cloned()
-        .collect();
-
-    let stages_added_from: BTreeSet<String> =
-        stage_names.intersection(add_from_stages).cloned().collect();
-
-    let used_stages: BTreeSet<String> = stages_used_as_base_images
+    let used_names: BTreeSet<String> = stages_used_as_base_images
         .iter()
-        .chain(stages_copied_from.iter())
-        .chain(stages_added_from.iter())
+        .chain(copy_from_stages.iter())
+        .chain(add_from_stages.iter())
+        .filter(|name| stage_names.contains(*name))
         .cloned()
         .collect();
+    let unused_stages = stage_names.difference(&used_names).cloned();
 
-    let unused_stages = stage_names.difference(&used_stages);
-    let is_multistage = num_stages >= 2 && !used_stages.is_empty();
+    let referenced_stage = !stages_used_as_base_images.is_empty()
+        || !copy_from_stages.is_empty()
+        || !add_from_stages.is_empty();
 
     models::MultistageAnalysis {
-        is_multistage,
+        is_multistage: num_stages >= 2 && referenced_stage,
         stages_used_as_base_images: stages_used_as_base_images.into_iter().collect(),
-        stages_copied_from: stages_copied_from.into_iter().collect(),
-        stages_added_from: stages_added_from.into_iter().collect(),
-        unused_stages: unused_stages.into_iter().cloned().collect(),
+        stages_copied_from: copy_from_stages.iter().cloned().collect(),
+        stages_added_from: add_from_stages.iter().cloned().collect(),
+        unused_stages: unused_stages.collect(),
     }
 }
 
-fn get_parsed_images(images: &BTreeSet<String>) -> Vec<models::Image> {
-    let mut parsed_images: Vec<models::Image> = vec![];
-    for img in images {
-        if let Ok(parsed) = DockerImage::parse(img) {
-            let components = models::ImageComponents {
-                registry: parsed.registry,
-                name: parsed.name,
-                tag: parsed.tag,
-                digest: parsed.digest,
-            };
-            parsed_images.push(models::Image {
-                full: img.clone(),
-                components: Some(components),
-            });
-        } else {
-            parsed_images.push(models::Image {
-                full: img.clone(),
-                components: None,
-            })
+fn extract_stage_info(stages: &[Stage]) -> StageInfo {
+    let mut images = BTreeSet::new();
+    let mut stage_names = BTreeSet::new();
+    let mut ordered_names = Vec::with_capacity(stages.len());
+
+    for stage in stages {
+        images.insert(normalize_image_ref(&stage.from.image.value));
+        let name = stage
+            .from
+            .as_
+            .as_ref()
+            .map(|(_, stage_name)| stage_name.value.to_lowercase());
+        if let Some(name) = &name {
+            stage_names.insert(name.clone());
         }
+        ordered_names.push(name);
     }
 
-    parsed_images
+    StageInfo {
+        images,
+        stage_names,
+        ordered_names,
+    }
 }
 
-pub fn analyze_dockerfile(body: &str) -> Result<models::Analysis, Box<dyn Error>> {
-    let df = parse(body)?;
-    let stages: Vec<_> = df.stages().collect();
-    let num_stages = stages.len();
+fn collect_instructions(
+    instructions: &[Instruction],
+    ordered_stage_names: &[Option<String>],
+) -> InstructionFacts {
+    let mut facts = InstructionFacts {
+        copy_from_stages: BTreeSet::new(),
+        add_from_stages: BTreeSet::new(),
+        copy_from_images: BTreeMap::new(),
+        add_from_images: BTreeMap::new(),
+        exposed_ports: BTreeSet::new(),
+        by_type: BTreeMap::new(),
+        total_count: 0,
+        args: BTreeMap::new(),
+        labels: BTreeMap::new(),
+        env_vars: BTreeMap::new(),
+    };
 
-    let (images, stage_names) = extract_stage_info(&stages);
-    let (copy_from_stages, add_from_stages) = extract_from_references(&df.instructions);
+    for instruction in instructions {
+        facts.total_count += 1;
+        let name = instruction_name(instruction);
+        *facts.by_type.entry(name.to_string()).or_insert(0) += 1;
 
-    let multistage_analysis = analyze_multistage(
-        num_stages,
-        &images,
-        &stage_names,
-        &copy_from_stages,
-        &add_from_stages,
-    );
-
-    let parsed_images: Vec<models::Image> = get_parsed_images(&images);
-    let exposed_ports = extract_ports(&df.instructions);
-    let instructions = extract_instructions(&df.instructions);
-    let kv_pairs = extract_key_value_pairs(&df.instructions);
-
-    Ok(models::Analysis {
-        num_stages,
-        images: parsed_images,
-        stage_names: stage_names.into_iter().collect(),
-        copy_from_stages: copy_from_stages.into_iter().collect(),
-        add_from_stages: add_from_stages.into_iter().collect(),
-        multistage_analysis,
-        exposed_ports: exposed_ports.into_iter().collect(),
-        instructions,
-        args: kv_pairs.args,
-        labels: kv_pairs.labels,
-        env_vars: kv_pairs.env_vars,
-    })
-}
-
-fn extract_key_value_pairs(instructions: &[Instruction]) -> models::KeyValueInstr {
-    let mut args: HashMap<String, Option<String>> = HashMap::new();
-    let mut labels: HashMap<String, String> = HashMap::new();
-    let mut env_vars: HashMap<String, String> = HashMap::new();
-
-    for ins in instructions {
-        match ins {
-            Instruction::Arg(a) => args.extend(parse_utils::parse_kv_instruction_opt_val(
-                a.arguments.value.as_ref(),
-            )),
-            Instruction::Label(l) => labels.extend(parse_utils::parse_kv_instruction(
-                l.arguments.value.as_ref(),
-            )),
-            Instruction::Env(e) => env_vars.extend(parse_utils::parse_kv_instruction(
-                e.arguments.value.as_ref(),
-            )),
+        match instruction {
+            Instruction::Arg(arg) => {
+                parse_utils::merge_kv_pairs(
+                    &mut facts.args,
+                    parse_utils::parse_kv_pairs(arg.arguments.value.as_ref(), false),
+                );
+            }
+            Instruction::Env(env) => {
+                insert_required_values(
+                    &mut facts.env_vars,
+                    parse_utils::parse_kv_pairs(env.arguments.value.as_ref(), true),
+                );
+            }
+            Instruction::Label(label) => {
+                insert_required_values(
+                    &mut facts.labels,
+                    parse_utils::parse_kv_pairs(label.arguments.value.as_ref(), true),
+                );
+            }
+            Instruction::Expose(expose) => {
+                facts
+                    .exposed_ports
+                    .extend(expose.arguments.iter().map(|port| port.value.to_string()));
+            }
+            Instruction::Copy(copy) => {
+                record_from_flag(
+                    &copy.options,
+                    ordered_stage_names,
+                    &mut facts.copy_from_stages,
+                    &mut facts.copy_from_images,
+                );
+            }
+            Instruction::Add(add) => {
+                record_from_flag(
+                    &add.options,
+                    ordered_stage_names,
+                    &mut facts.add_from_stages,
+                    &mut facts.add_from_images,
+                );
+            }
             _ => {}
         }
     }
 
-    KeyValueInstr {
-        args,
-        labels,
-        env_vars,
+    facts
+}
+
+fn insert_required_values(
+    into: &mut BTreeMap<String, String>,
+    pairs: BTreeMap<String, Option<String>>,
+) {
+    for (key, value) in pairs {
+        into.insert(key, value.unwrap_or_default());
     }
 }
 
-fn extract_instructions(instructions: &[Instruction]) -> models::InstructionStats {
-    let mut by_type = HashMap::new();
-    for ins in instructions {
-        let s = match ins {
-            Instruction::Add(..) => constants::ADD.to_string(),
-            Instruction::Arg(..) => constants::ARG.to_string(),
-            Instruction::Cmd(..) => constants::CMD.to_string(),
-            Instruction::Copy(..) => constants::COPY.to_string(),
-            Instruction::Entrypoint(..) => constants::ENTRYPOINT.to_string(),
-            Instruction::Env(..) => constants::ENV.to_string(),
-            Instruction::Expose(..) => constants::EXPOSE.to_string(),
-            Instruction::From(..) => constants::FROM_UC.to_string(),
-            Instruction::Healthcheck(..) => constants::HEALTHCHECK.to_string(),
-            Instruction::Label(..) => constants::LABEL.to_string(),
-            Instruction::Maintainer(..) => constants::MAINTAINER.to_string(),
-            Instruction::Onbuild(..) => constants::ONBUILD.to_string(),
-            Instruction::Run(..) => constants::RUN.to_string(),
-            Instruction::Shell(..) => constants::SHELL.to_string(),
-            Instruction::Stopsignal(..) => constants::STOPSIGNAL.to_string(),
-            Instruction::User(..) => constants::USER.to_string(),
-            Instruction::Volume(..) => constants::VOLUME.to_string(),
-            Instruction::Workdir(..) => constants::WORKDIR.to_string(),
-            &_ => "".to_string(),
-        };
-        *by_type.entry(s).or_insert(0) += 1;
-    }
-
-    models::InstructionStats {
-        total_count: instructions.len() as u32,
-        by_type,
-    }
-}
-
-fn extract_ports(instructions: &[Instruction]) -> BTreeSet<String> {
-    let mut all_ports = BTreeSet::new();
-    for ins in instructions {
-        let mut ports = match ins {
-            Instruction::Expose(exp) => exp.arguments.iter().map(|x| x.value.to_string()).collect(),
-            _ => BTreeSet::new(),
-        };
-        all_ports.append(&mut ports);
-    }
-
-    all_ports
-}
-
-fn extract_stage_info(stages: &[Stage]) -> (BTreeSet<String>, BTreeSet<String>) {
-    let images = stages
-        .iter()
-        .map(|s| {
-            let value = s.from.image.value.to_string();
-            match value.starts_with('$') {
-                true => value,
-                false => value.to_lowercase(),
-            }
-        })
-        .collect();
-
-    let stage_names = stages
-        .iter()
-        .filter_map(|s| s.from.as_.as_ref())
-        .map(|stage_name| stage_name.1.value.to_string().to_lowercase())
-        .collect();
-
-    (images, stage_names)
-}
-
-fn extract_from_references(instructions: &[Instruction]) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut copy_from_stages = BTreeSet::new();
-    let mut add_from_stages = BTreeSet::new();
-
-    for ins in instructions {
-        let from_val = match ins {
-            Instruction::Copy(c) => get_from_flag_val(c),
-            Instruction::Add(a) => get_from_flag_val(a),
-            _ => continue,
-        };
-
-        if let Some(val) = from_val {
-            let target_set = match ins {
-                Instruction::Copy(_) => &mut copy_from_stages,
-                Instruction::Add(_) => &mut add_from_stages,
-                _ => unreachable!(),
-            };
-            target_set.insert(val.to_lowercase());
+fn record_from_flag(
+    options: &[Flag],
+    ordered_stage_names: &[Option<String>],
+    stages: &mut BTreeSet<String>,
+    images: &mut BTreeMap<String, models::Image>,
+) {
+    let Some(raw) = from_flag_value(options) else {
+        return;
+    };
+    match resolve_from_target(&raw, ordered_stage_names) {
+        FromTarget::Stage(name) => {
+            stages.insert(name);
+        }
+        FromTarget::Image(reference) => {
+            images
+                .entry(reference.clone())
+                .or_insert_with(|| parse_image(&reference));
         }
     }
+}
 
-    (copy_from_stages, add_from_stages)
+fn from_flag_value(options: &[Flag]) -> Option<String> {
+    options.iter().find_map(|flag| {
+        flag.name
+            .value
+            .eq_ignore_ascii_case(constants::FROM)
+            .then(|| flag.value.as_ref().map(|value| value.value.to_string()))
+            .flatten()
+    })
+}
+
+/// Map a `--from` value to a stage or an external image.
+///
+/// An all-digit value is a stage index. Docker uses the index even when a
+/// stage happens to be named with that same number, and even when the index
+/// is out of range. An in-range index of an unnamed stage is reported as the
+/// decimal index. Any other value that is not a known stage name is an image
+/// reference. `$VAR` references are not expanded and keep their original case.
+fn resolve_from_target(raw: &str, ordered_stage_names: &[Option<String>]) -> FromTarget {
+    if raw.contains('$') {
+        let folded = raw.to_lowercase();
+        if is_known_stage(&folded, ordered_stage_names) {
+            return FromTarget::Stage(folded);
+        }
+        return FromTarget::Image(raw.to_string());
+    }
+
+    let normalized = raw.to_lowercase();
+    if is_stage_index(&normalized) {
+        return FromTarget::Stage(stage_index_label(&normalized, ordered_stage_names));
+    }
+    if is_known_stage(&normalized, ordered_stage_names) {
+        return FromTarget::Stage(normalized);
+    }
+    FromTarget::Image(normalized)
+}
+
+fn is_known_stage(name: &str, ordered_stage_names: &[Option<String>]) -> bool {
+    ordered_stage_names
+        .iter()
+        .any(|stage_name| stage_name.as_deref() == Some(name))
+}
+
+fn is_stage_index(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn stage_index_label(index_text: &str, ordered_stage_names: &[Option<String>]) -> String {
+    let Ok(index) = index_text.parse::<usize>() else {
+        return index_text.to_string();
+    };
+    match ordered_stage_names.get(index) {
+        Some(Some(name)) => name.clone(),
+        Some(None) => index.to_string(),
+        None => index_text.to_string(),
+    }
+}
+
+fn instruction_name(instruction: &Instruction) -> &'static str {
+    match instruction {
+        Instruction::Add(_) => constants::ADD,
+        Instruction::Arg(_) => constants::ARG,
+        Instruction::Cmd(_) => constants::CMD,
+        Instruction::Copy(_) => constants::COPY,
+        Instruction::Entrypoint(_) => constants::ENTRYPOINT,
+        Instruction::Env(_) => constants::ENV,
+        Instruction::Expose(_) => constants::EXPOSE,
+        Instruction::From(_) => constants::FROM_UC,
+        Instruction::Healthcheck(_) => constants::HEALTHCHECK,
+        Instruction::Label(_) => constants::LABEL,
+        Instruction::Maintainer(_) => constants::MAINTAINER,
+        Instruction::Onbuild(_) => constants::ONBUILD,
+        Instruction::Run(_) => constants::RUN,
+        Instruction::Shell(_) => constants::SHELL,
+        Instruction::Stopsignal(_) => constants::STOPSIGNAL,
+        Instruction::User(_) => constants::USER,
+        Instruction::Volume(_) => constants::VOLUME,
+        Instruction::Workdir(_) => constants::WORKDIR,
+        _ => "UNKNOWN",
+    }
+}
+
+fn normalize_image_ref(value: &str) -> String {
+    if value.contains('$') {
+        value.to_string()
+    } else {
+        value.to_lowercase()
+    }
+}
+
+fn parse_images(images: &BTreeSet<String>) -> Vec<models::Image> {
+    images.iter().map(|image| parse_image(image)).collect()
+}
+
+fn parse_image(reference: &str) -> models::Image {
+    if reference_has_variable(reference) {
+        return models::Image {
+            full: reference.to_string(),
+            components: None,
+        };
+    }
+    let components = DockerImage::parse(reference)
+        .ok()
+        .map(|parsed| models::ImageComponents {
+            registry: parsed.registry,
+            name: parsed.name,
+            tag: parsed.tag,
+            digest: parsed.digest,
+        })
+        .or_else(|| fallback_components(reference));
+    models::Image {
+        full: reference.to_string(),
+        components,
+    }
+}
+
+fn reference_has_variable(reference: &str) -> bool {
+    reference.starts_with('$') || reference.contains("${")
+}
+
+/// Split `registry/name:tag@digest` when `docker-image` rejects the reference.
+///
+/// The common miss is a short digest. Variable references are left unparsed.
+fn fallback_components(reference: &str) -> Option<models::ImageComponents> {
+    if reference.is_empty() || reference.contains(char::is_whitespace) {
+        return None;
+    }
+    let (without_digest, digest) = split_digest(reference)?;
+    let (name_part, tag) = split_tag(without_digest);
+    let (registry, name) = split_registry(name_part)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(models::ImageComponents {
+        registry,
+        name,
+        tag,
+        digest,
+    })
+}
+
+fn split_digest(reference: &str) -> Option<(&str, Option<String>)> {
+    match reference.rsplit_once('@') {
+        Some((rest, digest)) if is_digest(digest) && !rest.is_empty() => {
+            Some((rest, Some(digest.to_string())))
+        }
+        Some(_) => None,
+        None => Some((reference, None)),
+    }
+}
+
+fn is_digest(digest: &str) -> bool {
+    let Some((algorithm, hex_digits)) = digest.split_once(':') else {
+        return false;
+    };
+    !algorithm.is_empty()
+        && algorithm
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && !hex_digits.is_empty()
+        && hex_digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn split_tag(reference: &str) -> (&str, Option<String>) {
+    match reference.rfind(':') {
+        Some(index) if !reference[index + 1..].contains('/') => {
+            let tag = &reference[index + 1..];
+            if tag.is_empty() {
+                (reference, None)
+            } else {
+                (&reference[..index], Some(tag.to_string()))
+            }
+        }
+        _ => (reference, None),
+    }
+}
+
+fn split_registry(name_part: &str) -> Option<(Option<String>, String)> {
+    let Some((first, rest)) = name_part.split_once('/') else {
+        return Some((None, name_part.to_string()));
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    if first == "localhost" || first.contains('.') || first.contains(':') {
+        Some((Some(first.to_string()), rest.to_string()))
+    } else {
+        Some((None, name_part.to_string()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::vec;
+
+    fn image(full: &str, name: &str, tag: Option<&str>, digest: Option<&str>) -> models::Image {
+        models::Image {
+            full: full.to_string(),
+            components: Some(models::ImageComponents {
+                registry: None,
+                name: name.to_string(),
+                tag: tag.map(str::to_string),
+                digest: digest.map(str::to_string),
+            }),
+        }
+    }
+
+    fn image_with_registry(
+        full: &str,
+        registry: &str,
+        name: &str,
+        tag: Option<&str>,
+        digest: Option<&str>,
+    ) -> models::Image {
+        models::Image {
+            full: full.to_string(),
+            components: Some(models::ImageComponents {
+                registry: Some(registry.to_string()),
+                name: name.to_string(),
+                tag: tag.map(str::to_string),
+                digest: digest.map(str::to_string),
+            }),
+        }
+    }
 
     #[test]
     fn test_multistage() {
@@ -309,27 +494,20 @@ CMD ["uvicorn", "--host", "0.0.0.0", "--port", "5000", "app.main:app"]"#;
             stages_added_from: vec![],
             unused_stages: vec!["test".to_string()],
         };
-        let images: Vec<models::Image> = vec![models::Image {
-            full: "base".to_string(),
-            components: Some(models::ImageComponents {
-                registry: None,
-                name: "base".to_string(),
-                tag: None,
-                digest: None,
-            }),
-        }, models::Image {
-        full: "docker.abc.com/base-images/python:3.13-debian@sha256:55f1d15ef4c37870e23c03e89ad238940b55c8ede9f13fac4b7d71c7955f1053".to_string(),
-        components: Some(models::ImageComponents {
-            registry: Some("docker.abc.com".to_string()),
-            name: "base-images/python".to_string(),
-            tag: Some("3.13-debian".to_string()),
-            digest: Some("sha256:55f1d15ef4c37870e23c03e89ad238940b55c8ede9f13fac4b7d71c7955f1053".to_string()),
-        }),
-    }];
+        let images: Vec<models::Image> = vec![
+            image("base", "base", None, None),
+            image_with_registry(
+                "docker.abc.com/base-images/python:3.13-debian@sha256:55f1d15ef4c37870e23c03e89ad238940b55c8ede9f13fac4b7d71c7955f1053",
+                "docker.abc.com",
+                "base-images/python",
+                Some("3.13-debian"),
+                Some("sha256:55f1d15ef4c37870e23c03e89ad238940b55c8ede9f13fac4b7d71c7955f1053"),
+            ),
+        ];
 
         let instructions = models::InstructionStats {
             total_count: 22,
-            by_type: HashMap::from([
+            by_type: BTreeMap::from([
                 ("ARG".to_string(), 1),
                 ("CMD".to_string(), 1),
                 ("COPY".to_string(), 5),
@@ -343,7 +521,7 @@ CMD ["uvicorn", "--host", "0.0.0.0", "--port", "5000", "app.main:app"]"#;
             ]),
         };
 
-        let env_vars = HashMap::from([
+        let env_vars = BTreeMap::from([
             ("PYTHONPATH".into(), "/src".into()),
             ("PYTHONUNBUFFERED".into(), "1".into()),
             (
@@ -354,8 +532,8 @@ CMD ["uvicorn", "--host", "0.0.0.0", "--port", "5000", "app.main:app"]"#;
             ("GIT_COMMIT".into(), "$GIT_COMMIT".into()),
         ]);
 
-        let args = HashMap::from([("GIT_COMMIT".into(), None)]);
-        let labels = HashMap::from([
+        let args = BTreeMap::from([("GIT_COMMIT".into(), None)]);
+        let labels = BTreeMap::from([
             ("org.opencontainers.image.title".into(), "My App".into()),
             ("org.opencontainers.image.version".into(), "1.0".into()),
             (
@@ -367,9 +545,12 @@ CMD ["uvicorn", "--host", "0.0.0.0", "--port", "5000", "app.main:app"]"#;
         let expected = models::Analysis {
             num_stages: 3,
             stage_names: vec!["base".to_string(), "test".to_string()],
+            final_stage: None,
             images,
             copy_from_stages: vec![],
             add_from_stages: vec![],
+            copy_from_images: vec![],
+            add_from_images: vec![],
             multistage_analysis: msa,
             exposed_ports: vec!["5000".to_string()],
             instructions,
@@ -391,6 +572,7 @@ CMD ["uvicorn", "--host", "0.0.0.0", "--port", "5000", "app.main:app"]"#;
         let err_text = res.unwrap_err().to_string();
         assert!(err_text.contains("unknown instruction 'invalid'"));
     }
+
     #[test]
     fn test_single_stage() {
         let dockerfile = r#"
@@ -434,19 +616,10 @@ CMD ["npm", "start"]
             stages_added_from: vec![],
             unused_stages: vec![],
         };
-        let images: Vec<models::Image> = vec![models::Image {
-            full: "node:20-alpine".to_string(),
-            components: Some(models::ImageComponents {
-                registry: None,
-                name: "node".to_string(),
-                tag: Some("20-alpine".to_string()),
-                digest: None,
-            }),
-        }];
-
+        let images = vec![image("node:20-alpine", "node", Some("20-alpine"), None)];
         let instructions = models::InstructionStats {
             total_count: 11,
-            by_type: HashMap::from([
+            by_type: BTreeMap::from([
                 ("CMD".to_string(), 1),
                 ("COPY".to_string(), 2),
                 ("ENV".to_string(), 1),
@@ -457,21 +630,21 @@ CMD ["npm", "start"]
                 ("WORKDIR".to_string(), 1),
             ]),
         };
-
-        let env_vars = HashMap::from([("NODE_ENV".into(), "production".into())]);
-
         let expected = models::Analysis {
             num_stages: 1,
             stage_names: vec![],
+            final_stage: None,
             images,
             copy_from_stages: vec![],
             add_from_stages: vec![],
+            copy_from_images: vec![],
+            add_from_images: vec![],
             multistage_analysis: msa,
             exposed_ports: vec!["3000".to_string()],
             instructions,
-            args: HashMap::new(),
-            labels: HashMap::new(),
-            env_vars,
+            args: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            env_vars: BTreeMap::from([("NODE_ENV".into(), "production".into())]),
         };
         let res = analyze_dockerfile(dockerfile);
         assert!(res.is_ok());
@@ -554,29 +727,13 @@ CMD ["node", "server.js"]
             stages_added_from: vec!["config-builder".to_string()],
             unused_stages: vec!["production".to_string()],
         };
-        let images: Vec<models::Image> = vec![
-            models::Image {
-                full: "alpine:3.18".to_string(),
-                components: Some(models::ImageComponents {
-                    registry: None,
-                    name: "alpine".to_string(),
-                    tag: Some("3.18".to_string()),
-                    digest: None,
-                }),
-            },
-            models::Image {
-                full: "node:20-alpine".to_string(),
-                components: Some(models::ImageComponents {
-                    registry: None,
-                    name: "node".to_string(),
-                    tag: Some("20-alpine".to_string()),
-                    digest: None,
-                }),
-            },
+        let images = vec![
+            image("alpine:3.18", "alpine", Some("3.18"), None),
+            image("node:20-alpine", "node", Some("20-alpine"), None),
         ];
         let instructions = models::InstructionStats {
             total_count: 31,
-            by_type: HashMap::from([
+            by_type: BTreeMap::from([
                 ("ADD".to_string(), 3),
                 ("CMD".to_string(), 1),
                 ("COPY".to_string(), 10),
@@ -588,7 +745,6 @@ CMD ["node", "server.js"]
                 ("WORKDIR".to_string(), 4),
             ]),
         };
-
         let expected = models::Analysis {
             num_stages: 4,
             stage_names: vec![
@@ -597,15 +753,18 @@ CMD ["node", "server.js"]
                 "dependencies".to_string(),
                 "production".to_string(),
             ],
+            final_stage: Some("production".to_string()),
             images,
             copy_from_stages: vec!["builder".to_string(), "dependencies".to_string()],
             add_from_stages: vec!["config-builder".to_string()],
+            copy_from_images: vec![],
+            add_from_images: vec![],
             multistage_analysis: msa,
             exposed_ports: vec!["8080".to_string()],
             instructions,
-            args: HashMap::new(),
-            labels: HashMap::new(),
-            env_vars: HashMap::new(),
+            args: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            env_vars: BTreeMap::new(),
         };
         let res = analyze_dockerfile(dockerfile);
         assert!(res.is_ok());
@@ -673,29 +832,13 @@ CMD ["./app"]
             stages_added_from: vec!["downloader".to_string()],
             unused_stages: vec![],
         };
-        let images: Vec<models::Image> = vec![
-            models::Image {
-                full: "alpine:3.18".to_string(),
-                components: Some(models::ImageComponents {
-                    registry: None,
-                    name: "alpine".to_string(),
-                    tag: Some("3.18".to_string()),
-                    digest: None,
-                }),
-            },
-            models::Image {
-                full: "golang:1.21-alpine".to_string(),
-                components: Some(models::ImageComponents {
-                    registry: None,
-                    name: "golang".to_string(),
-                    tag: Some("1.21-alpine".to_string()),
-                    digest: None,
-                }),
-            },
+        let images = vec![
+            image("alpine:3.18", "alpine", Some("3.18"), None),
+            image("golang:1.21-alpine", "golang", Some("1.21-alpine"), None),
         ];
         let instructions = models::InstructionStats {
             total_count: 27,
-            by_type: HashMap::from([
+            by_type: BTreeMap::from([
                 ("ADD".to_string(), 2),
                 ("CMD".to_string(), 1),
                 ("COPY".to_string(), 5),
@@ -706,7 +849,6 @@ CMD ["./app"]
                 ("WORKDIR".to_string(), 4),
             ]),
         };
-
         let expected = models::Analysis {
             num_stages: 4,
             stage_names: vec![
@@ -714,46 +856,41 @@ CMD ["./app"]
                 "downloader".to_string(),
                 "go-builder".to_string(),
             ],
+            final_stage: None,
             images,
             copy_from_stages: vec!["cert-generator".to_string(), "go-builder".to_string()],
             add_from_stages: vec!["downloader".to_string()],
+            copy_from_images: vec![],
+            add_from_images: vec![],
             multistage_analysis: msa,
             exposed_ports: vec!["8080".to_string(), "8443".to_string()],
             instructions,
-            args: HashMap::new(),
-            labels: HashMap::new(),
-            env_vars: HashMap::new(),
+            args: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            env_vars: BTreeMap::new(),
         };
         let res = analyze_dockerfile(dockerfile);
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), expected);
     }
 
-    #[cfg(test)]
-    mod additional_tests {
-        use super::*;
-        use std::vec;
+    #[test]
+    fn test_empty_dockerfile() {
+        assert!(analyze_dockerfile("").is_err());
+    }
 
-        #[test]
-        fn test_empty_dockerfile() {
-            let dockerfile = "";
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_err());
-        }
-
-        #[test]
-        fn test_dockerfile_with_only_comments() {
-            let dockerfile = r#"
+    #[test]
+    fn test_dockerfile_with_only_comments() {
+        let dockerfile = r#"
 # This is a comment
 # Another comment
         "#;
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_err());
-        }
+        assert!(analyze_dockerfile(dockerfile).is_err());
+    }
 
-        #[test]
-        fn test_case_insensitive_instructions() {
-            let dockerfile = r#"
+    #[test]
+    fn test_case_insensitive_instructions() {
+        let dockerfile = r#"
 from node:18-alpine as builder
 workdir /app
 copy package*.json ./
@@ -766,69 +903,18 @@ copy --from=builder /app/dist /usr/share/nginx/html
 expose 80
 cmd ["nginx", "-g", "daemon off;"]
 "#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert!(analysis.multistage_analysis.is_multistage);
+        assert_eq!(analysis.stage_names, vec!["builder".to_string()]);
+        assert_eq!(analysis.final_stage, None);
+        assert_eq!(analysis.copy_from_stages, vec!["builder".to_string()]);
+        assert_eq!(analysis.exposed_ports, vec!["80".to_string()]);
+        assert_eq!(analysis.images.len(), 2);
+    }
 
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec!["builder".to_string()],
-                stages_added_from: vec![],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: "nginx:alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "nginx".to_string(),
-                        tag: Some("alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "node:18-alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "node".to_string(),
-                        tag: Some("18-alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-
-            let instructions = models::InstructionStats {
-                total_count: 10,
-                by_type: HashMap::from([
-                    ("CMD".to_string(), 1),
-                    ("COPY".to_string(), 3),
-                    ("EXPOSE".to_string(), 1),
-                    ("FROM".to_string(), 2),
-                    ("RUN".to_string(), 2),
-                    ("WORKDIR".to_string(), 1),
-                ]),
-            };
-
-            let expected = models::Analysis {
-                num_stages: 2,
-                stage_names: vec!["builder".to_string()],
-                images,
-                copy_from_stages: vec!["builder".to_string()],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec!["80".to_string()],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_multistage_with_stage_used_as_base_and_copy_source() {
-            let dockerfile = r#"
+    #[test]
+    fn test_multistage_with_stage_used_as_base_and_copy_source() {
+        let dockerfile = r#"
 FROM ubuntu:20.04 AS base
 RUN apt-get update && apt-get install -y curl
 WORKDIR /app
@@ -841,69 +927,23 @@ FROM base
 COPY --from=builder /app/dist ./
 CMD ["./app"]
 "#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert!(analysis.multistage_analysis.is_multistage);
+        assert_eq!(
+            analysis.multistage_analysis.stages_used_as_base_images,
+            vec!["base".to_string()]
+        );
+        assert_eq!(
+            analysis.multistage_analysis.stages_copied_from,
+            vec!["builder".to_string()]
+        );
+        assert!(analysis.multistage_analysis.unused_stages.is_empty());
+        assert_eq!(analysis.final_stage, None);
+    }
 
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec!["base".to_string()],
-                stages_copied_from: vec!["builder".to_string()],
-                stages_added_from: vec![],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: "base".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "base".to_string(),
-                        tag: None,
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "ubuntu:20.04".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "ubuntu".to_string(),
-                        tag: Some("20.04".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-            let instructions = models::InstructionStats {
-                total_count: 9,
-                by_type: HashMap::from([
-                    ("CMD".to_string(), 1),
-                    ("COPY".to_string(), 2),
-                    ("FROM".to_string(), 3),
-                    ("RUN".to_string(), 2),
-                    ("WORKDIR".to_string(), 1),
-                ]),
-            };
-
-            let env_vars = HashMap::new();
-
-            let expected = models::Analysis {
-                num_stages: 3,
-                stage_names: vec!["base".to_string(), "builder".to_string()],
-                images,
-                copy_from_stages: vec!["builder".to_string()],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars,
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_dockerfile_with_arg_in_from() {
-            let dockerfile = r#"
+    #[test]
+    fn test_dockerfile_with_arg_in_from() {
+        let dockerfile = r#"
 ARG BASE_IMAGE=node:18-alpine
 FROM $BASE_IMAGE AS builder
 WORKDIR /app
@@ -913,63 +953,33 @@ RUN npm run build
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 "#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(
+            analysis.args,
+            BTreeMap::from([("BASE_IMAGE".into(), Some("node:18-alpine".into()))])
+        );
+        assert_eq!(analysis.images[0].full, "$BASE_IMAGE");
+        assert!(analysis.images[0].components.is_none());
+        assert_eq!(analysis.copy_from_stages, vec!["builder".to_string()]);
+    }
 
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec!["builder".to_string()],
-                stages_added_from: vec![],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: r"$BASE_IMAGE".to_string(),
-                    components: None,
-                },
-                models::Image {
-                    full: "nginx:alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "nginx".to_string(),
-                        tag: Some("alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-            let instructions = models::InstructionStats {
-                total_count: 7,
-                by_type: HashMap::from([
-                    ("ARG".to_string(), 1),
-                    ("COPY".to_string(), 2),
-                    ("FROM".to_string(), 2),
-                    ("RUN".to_string(), 1),
-                    ("WORKDIR".to_string(), 1),
-                ]),
-            };
-            let args = HashMap::from([("BASE_IMAGE".into(), Some("node:18-alpine".into()))]);
+    #[test]
+    fn test_arg_redeclaration_keeps_global_default() {
+        let dockerfile = r#"
+ARG VERSION=1
+FROM alpine:${VERSION}
+ARG VERSION
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(
+            analysis.args,
+            BTreeMap::from([("VERSION".into(), Some("1".into()))])
+        );
+    }
 
-            let expected = models::Analysis {
-                num_stages: 2,
-                stage_names: vec!["builder".to_string()],
-                images,
-                copy_from_stages: vec!["builder".to_string()],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args,
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_multistage_with_duplicate_stage_names() {
-            let dockerfile = r#"
+    #[test]
+    fn test_multistage_with_duplicate_stage_names() {
+        let dockerfile = r#"
 FROM ubuntu:20.04 AS base
 RUN apt-get update
 
@@ -979,535 +989,130 @@ RUN apk add --no-cache curl
 FROM scratch
 COPY --from=base /usr/bin/curl /usr/bin/curl
 "#;
+        let err_text = analyze_dockerfile(dockerfile).unwrap_err().to_string();
+        assert!(
+            err_text.contains("duplicate stage name 'base'"),
+            "unexpected error: {err_text}"
+        );
+    }
 
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_err());
-            let err_text = res.unwrap_err().to_string();
-            assert!(
-                err_text.contains("duplicate stage name 'base'"),
-                "unexpected error: {err_text}"
-            );
-        }
-
-        #[test]
-        fn test_multistage_with_self_referencing_stage() {
-            let dockerfile = r#"
-FROM ubuntu:20.04 AS base
-RUN apt-get update
-
-FROM base AS builder
-COPY . .
-RUN make build
-# This would be invalid in practice, but testing parser behavior
-COPY --from=builder /app/temp ./temp
-RUN process_temp
-
-FROM base
-COPY --from=builder /app/dist ./
-"#;
-
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec!["base".to_string()],
-                stages_copied_from: vec!["builder".to_string()],
-                stages_added_from: vec![],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: "base".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "base".to_string(),
-                        tag: None,
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "ubuntu:20.04".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "ubuntu".to_string(),
-                        tag: Some("20.04".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-            let instructions = models::InstructionStats {
-                total_count: 9,
-                by_type: HashMap::from([
-                    ("COPY".to_string(), 3),
-                    ("FROM".to_string(), 3),
-                    ("RUN".to_string(), 3),
-                ]),
-            };
-
-            let expected = models::Analysis {
-                num_stages: 3,
-                stage_names: vec!["base".to_string(), "builder".to_string()],
-                images,
-                copy_from_stages: vec!["builder".to_string()],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_multistage_with_only_add_from() {
-            let dockerfile = r#"
-FROM alpine:3.18 AS assets
-WORKDIR /assets
-RUN echo "config data" > config.json
-
-FROM ubuntu:20.04
-ADD --from=assets /assets/ ./assets/
-RUN cat assets/config.json
-"#;
-
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec![],
-                stages_added_from: vec!["assets".to_string()],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: "alpine:3.18".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "alpine".to_string(),
-                        tag: Some("3.18".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "ubuntu:20.04".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "ubuntu".to_string(),
-                        tag: Some("20.04".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-
-            let instructions = models::InstructionStats {
-                total_count: 6,
-                by_type: HashMap::from([
-                    ("ADD".to_string(), 1),
-                    ("FROM".to_string(), 2),
-                    ("RUN".to_string(), 2),
-                    ("WORKDIR".to_string(), 1),
-                ]),
-            };
-
-            let expected = models::Analysis {
-                num_stages: 2,
-                stage_names: vec!["assets".to_string()],
-                images,
-                copy_from_stages: vec![],
-                add_from_stages: vec!["assets".to_string()],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_dockerfile_with_whitespace_and_comments() {
-            let dockerfile = r#"
-# Build stage
-FROM node:18-alpine AS builder  
-WORKDIR /app
-# Install dependencies
-COPY package*.json ./
-RUN npm ci
-
-# Production stage  
-FROM node:18-alpine
-WORKDIR /app
-COPY --from=builder /app/node_modules ./node_modules
-# Copy source code
-COPY . .
-CMD ["npm", "start"]
-"#;
-
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec!["builder".to_string()],
-                stages_added_from: vec![],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![models::Image {
-                full: "node:18-alpine".to_string(),
-                components: Some(models::ImageComponents {
-                    registry: None,
-                    name: "node".to_string(),
-                    tag: Some("18-alpine".to_string()),
-                    digest: None,
-                }),
-            }];
-
-            let instructions = models::InstructionStats {
-                total_count: 9,
-                by_type: HashMap::from([
-                    ("CMD".to_string(), 1),
-                    ("COPY".to_string(), 3),
-                    ("FROM".to_string(), 2),
-                    ("RUN".to_string(), 1),
-                    ("WORKDIR".to_string(), 2),
-                ]),
-            };
-
-            let expected = models::Analysis {
-                num_stages: 2,
-                stage_names: vec!["builder".to_string()],
-                images,
-                copy_from_stages: vec!["builder".to_string()],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_multistage_with_unreferenced_stages() {
-            let dockerfile = r#"
-FROM ubuntu:20.04 AS unused-stage
-RUN apt-get update
-
-FROM alpine:3.18 AS another-unused
-RUN apk add --no-cache curl
-
-FROM node:18-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN npm run build
-
-FROM nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
-"#;
-
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec!["builder".to_string()],
-                stages_added_from: vec![],
-                unused_stages: vec!["another-unused".to_string(), "unused-stage".to_string()],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: "alpine:3.18".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "alpine".to_string(),
-                        tag: Some("3.18".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "nginx:alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "nginx".to_string(),
-                        tag: Some("alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "node:18-alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "node".to_string(),
-                        tag: Some("18-alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "ubuntu:20.04".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "ubuntu".to_string(),
-                        tag: Some("20.04".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-            let instructions = models::InstructionStats {
-                total_count: 10,
-                by_type: HashMap::from([
-                    ("COPY".to_string(), 2),
-                    ("FROM".to_string(), 4),
-                    ("RUN".to_string(), 3),
-                    ("WORKDIR".to_string(), 1),
-                ]),
-            };
-
-            let expected = models::Analysis {
-                num_stages: 4,
-                stage_names: vec![
-                    "another-unused".to_string(),
-                    "builder".to_string(),
-                    "unused-stage".to_string(),
-                ],
-                images,
-                copy_from_stages: vec!["builder".to_string()],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_dockerfile_with_platform_in_from() {
-            let dockerfile = r#"
-FROM --platform=linux/amd64 node:18-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN npm run build
-
-FROM --platform=linux/amd64 nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
-"#;
-
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec!["builder".to_string()],
-                stages_added_from: vec![],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: "nginx:alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "nginx".to_string(),
-                        tag: Some("alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "node:18-alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "node".to_string(),
-                        tag: Some("18-alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-            let instructions = models::InstructionStats {
-                total_count: 6,
-                by_type: HashMap::from([
-                    ("COPY".to_string(), 2),
-                    ("FROM".to_string(), 2),
-                    ("RUN".to_string(), 1),
-                    ("WORKDIR".to_string(), 1),
-                ]),
-            };
-
-            let expected = models::Analysis {
-                num_stages: 2,
-                stage_names: vec!["builder".to_string()],
-                images,
-                copy_from_stages: vec!["builder".to_string()],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_single_stage_with_scratch_image() {
-            let dockerfile = r#"
+    #[test]
+    fn test_numeric_from_resolves_named_stage() {
+        let dockerfile = r#"
+FROM alpine AS base
 FROM scratch
-COPY binary /
-CMD ["/binary"]
+COPY --from=0 /etc/os-release /
+ADD --from=0 /etc/os-release /from-add
 "#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert!(analysis.multistage_analysis.is_multistage);
+        assert_eq!(analysis.copy_from_stages, vec!["base".to_string()]);
+        assert_eq!(analysis.add_from_stages, vec!["base".to_string()]);
+        assert!(analysis.multistage_analysis.unused_stages.is_empty());
+        assert!(analysis.copy_from_images.is_empty());
+    }
 
-            let msa = models::MultistageAnalysis {
-                is_multistage: false,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec![],
-                stages_added_from: vec![],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![models::Image {
-                full: "scratch".to_string(),
-                components: Some(models::ImageComponents {
-                    registry: None,
-                    name: "scratch".to_string(),
-                    tag: None,
-                    digest: None,
-                }),
-            }];
-            let instructions = models::InstructionStats {
-                total_count: 3,
-                by_type: HashMap::from([
-                    ("CMD".to_string(), 1),
-                    ("COPY".to_string(), 1),
-                    ("FROM".to_string(), 1),
-                ]),
-            };
-
-            let expected = models::Analysis {
-                num_stages: 1,
-                stage_names: vec![],
-                images,
-                copy_from_stages: vec![],
-                add_from_stages: vec![],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
-
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
-
-        #[test]
-        fn test_multistage_complex_dependency_chain() {
-            let dockerfile = r#"
-FROM alpine:3.18 AS source
-RUN echo "source data" > /data.txt
-
-FROM ubuntu:20.04 AS processor
-COPY --from=source /data.txt ./
-RUN cat data.txt > processed.txt
-
-FROM node:18-alpine AS builder
-ADD --from=processor /processed.txt ./
-COPY . .
-RUN npm run build
-
-FROM nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
-ADD --from=source /data.txt /usr/share/nginx/html/
+    #[test]
+    fn test_numeric_from_unnamed_stage_reports_index() {
+        let dockerfile = r#"
+FROM alpine
+FROM scratch
+COPY --from=0 /etc/os-release /
 "#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert!(analysis.multistage_analysis.is_multistage);
+        assert_eq!(analysis.copy_from_stages, vec!["0".to_string()]);
+        assert_eq!(
+            analysis.multistage_analysis.stages_copied_from,
+            vec!["0".to_string()]
+        );
+        assert_eq!(analysis.final_stage, None);
+    }
 
-            let msa = models::MultistageAnalysis {
-                is_multistage: true,
-                stages_used_as_base_images: vec![],
-                stages_copied_from: vec!["builder".to_string(), "source".to_string()],
-                stages_added_from: vec!["processor".to_string(), "source".to_string()],
-                unused_stages: vec![],
-            };
-            let images: Vec<models::Image> = vec![
-                models::Image {
-                    full: "alpine:3.18".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "alpine".to_string(),
-                        tag: Some("3.18".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "nginx:alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "nginx".to_string(),
-                        tag: Some("alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "node:18-alpine".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "node".to_string(),
-                        tag: Some("18-alpine".to_string()),
-                        digest: None,
-                    }),
-                },
-                models::Image {
-                    full: "ubuntu:20.04".to_string(),
-                    components: Some(models::ImageComponents {
-                        registry: None,
-                        name: "ubuntu".to_string(),
-                        tag: Some("20.04".to_string()),
-                        digest: None,
-                    }),
-                },
-            ];
-            let instructions = models::InstructionStats {
-                total_count: 12,
-                by_type: HashMap::from([
-                    ("ADD".to_string(), 2),
-                    ("COPY".to_string(), 3),
-                    ("FROM".to_string(), 4),
-                    ("RUN".to_string(), 3),
-                ]),
-            };
+    #[test]
+    fn test_external_from_is_an_image() {
+        let dockerfile = r#"
+FROM alpine
+COPY --from=nginx:1.25 /etc/nginx /etc/nginx
+ADD --from=ghcr.io/org/app:1.2 /bin/app /bin/app
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert!(!analysis.multistage_analysis.is_multistage);
+        assert!(analysis.copy_from_stages.is_empty());
+        assert!(analysis.add_from_stages.is_empty());
+        assert_eq!(
+            analysis.copy_from_images,
+            vec![image("nginx:1.25", "nginx", Some("1.25"), None)]
+        );
+        assert_eq!(
+            analysis.add_from_images,
+            vec![image_with_registry(
+                "ghcr.io/org/app:1.2",
+                "ghcr.io",
+                "org/app",
+                Some("1.2"),
+                None
+            )]
+        );
+    }
 
-            let expected = models::Analysis {
-                num_stages: 4,
-                stage_names: vec![
-                    "builder".to_string(),
-                    "processor".to_string(),
-                    "source".to_string(),
-                ],
-                images,
-                copy_from_stages: vec!["builder".to_string(), "source".to_string()],
-                add_from_stages: vec!["processor".to_string(), "source".to_string()],
-                multistage_analysis: msa,
-                exposed_ports: vec![],
-                instructions,
-                args: HashMap::new(),
-                labels: HashMap::new(),
-                env_vars: HashMap::new(),
-            };
+    #[test]
+    fn test_from_index_beats_stage_named_with_digits() {
+        let dockerfile = r#"
+FROM alpine AS 0
+FROM scratch
+COPY --from=0 /x /x
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(analysis.stage_names, vec!["0".to_string()]);
+        assert_eq!(analysis.copy_from_stages, vec!["0".to_string()]);
+        assert!(analysis.multistage_analysis.is_multistage);
+    }
 
-            let res = analyze_dockerfile(dockerfile);
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), expected);
-        }
+    #[test]
+    fn test_short_digest_uses_component_fallback() {
+        let dockerfile = "FROM python:3.12-slim@sha256:abcdef\n";
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(
+            analysis.images,
+            vec![image(
+                "python:3.12-slim@sha256:abcdef",
+                "python",
+                Some("3.12-slim"),
+                Some("sha256:abcdef")
+            )]
+        );
+    }
+
+    #[test]
+    fn test_variable_image_is_not_expanded() {
+        let dockerfile = r#"
+ARG REG=docker.io
+FROM ${REG}/library/ubuntu:${TAG:-22.04} AS build
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(
+            analysis.images[0].full,
+            "${REG}/library/ubuntu:${TAG:-22.04}"
+        );
+        assert!(analysis.images[0].components.is_none());
+        assert_eq!(analysis.final_stage, Some("build".to_string()));
+        assert_eq!(
+            analysis.multistage_analysis.unused_stages,
+            vec!["build".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_repr_uses_python_none_and_nested_components() {
+        let analysis = analyze_dockerfile("FROM alpine\nARG VERSION\n").unwrap();
+        let rendered = analysis.repr();
+        assert!(rendered.contains("final_stage=None"));
+        assert!(rendered.contains("args={\"VERSION\": None}"));
+        assert!(rendered.contains(
+            "components=ImageComponents(registry=None, name=\"alpine\", tag=None, digest=None)"
+        ));
+        assert!(!rendered.contains("components=\"ImageComponents"));
+        assert!(!rendered.contains("Some("));
     }
 }

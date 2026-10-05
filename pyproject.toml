@@ -9,7 +9,6 @@ requires-python = ">=3.13"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
 ]
 license = "MIT"
 license-files = ["LICEN[CS]E*"]

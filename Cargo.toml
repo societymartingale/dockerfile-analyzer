@@ -13,4 +13,3 @@ pyo3 = "0.29.0"
 docker-image = {version = "0.2.1"}
 parse-dockerfile = { version = "0.1.7", default-features = false }
 shlex = "2.0.1"
-serde = { version = "1.0.228", features = ["derive"] }
