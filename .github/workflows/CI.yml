@@ -32,6 +32,8 @@ jobs:
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          # A commit pin does not get the branch-name default of stable.
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check formatting
@@ -53,6 +55,9 @@ jobs:
           # matching libpython for linking the test binary).
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          # A commit pin does not get the branch-name default of stable.
+          toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
         run: cargo test
@@ -70,6 +75,9 @@ jobs:
           # Keep in sync with requires-python in pyproject.toml.
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          # A commit pin does not get the branch-name default of stable.
+          toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install dev dependencies
         run: |
