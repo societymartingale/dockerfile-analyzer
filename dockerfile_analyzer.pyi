@@ -7,13 +7,17 @@ def analyze_dockerfile(body: str) -> Analysis:
         dockerfile_content (str): The content of the Dockerfile to analyze
 
     Returns:
-        Analysis: A comprehensive analysis object containing information about:
-            - Number of stages and stage names
-            - Base images used
-            - Multistage analysis (if applicable)
-            - Instructions statistics
-            - Environment variables, labels, and arguments
-            - Exposed ports
+        Analysis: Stages, images, instruction counts, ARG/ENV/LABEL values,
+        and exposed ports. ``COPY --from`` and ``ADD --from`` indexes are
+        resolved to stages. External ``--from`` images are returned separately
+        from stage names.
+
+        Image references that do not contain a variable are lowercased.
+        ``${VAR}`` and ``$VAR`` are not expanded. ``EXPOSE`` values are raw
+        tokens, including protocol suffixes and ranges. ``stage_names`` lists
+        named stages only; ``final_stage`` is the last stage name, or None
+        when it is unnamed. A later ``ARG NAME`` without a value keeps an
+        earlier default.
 
     Raises:
         ValueError: If the dockerfile content is empty or invalid
@@ -31,8 +35,11 @@ class Analysis:
     num_stages: int
     images: List[Image]
     stage_names: List[str]
+    final_stage: Optional[str]
     copy_from_stages: List[str]
     add_from_stages: List[str]
+    copy_from_images: List[Image]
+    add_from_images: List[Image]
     multistage_analysis: MultistageAnalysis
     exposed_ports: List[str]
     instructions: InstructionStats
@@ -72,14 +79,6 @@ class MultistageAnalysis:
     stages_copied_from: List[str]
     stages_added_from: List[str]
     unused_stages: List[str]
-
-    def to_dict(self) -> Dict[str, Any]: ...
-    def __repr__(self) -> str: ...
-
-class KeyValueInstr:
-    args: Dict[str, Optional[str]]
-    labels: Dict[str, str]
-    env_vars: Dict[str, str]
 
     def to_dict(self) -> Dict[str, Any]: ...
     def __repr__(self) -> str: ...
