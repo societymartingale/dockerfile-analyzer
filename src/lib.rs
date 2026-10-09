@@ -22,6 +22,10 @@ Returns:
     only; `final_stage` is the last stage name, or None when it is unnamed.
     A later `ARG NAME` without a value keeps an earlier default.
 
+    `args`, `labels`, `env_vars`, and `exposed_ports` are merged across all
+    stages. `stages` lists each stage with the values it sets itself, and
+    `final_stage_info` is the last `Stage` (None when there are no stages).
+
 Raises:
     ValueError: If the dockerfile content is empty or invalid
 
@@ -47,5 +51,6 @@ fn dockerfile_analyzer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<models::Image>()?;
     m.add_class::<models::ImageComponents>()?;
     m.add_class::<models::InstructionStats>()?;
+    m.add_class::<models::Stage>()?;
     Ok(())
 }

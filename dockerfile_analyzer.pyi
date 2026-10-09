@@ -19,6 +19,11 @@ def analyze_dockerfile(body: str) -> Analysis:
         when it is unnamed. A later ``ARG NAME`` without a value keeps an
         earlier default.
 
+        ``args``, ``labels``, ``env_vars``, and ``exposed_ports`` are merged
+        across all stages. ``stages`` lists each stage with the values it sets
+        itself, and ``final_stage_info`` is the last ``Stage`` (None when
+        there are no stages).
+
     Raises:
         ValueError: If the dockerfile content is empty or invalid
 
@@ -32,6 +37,16 @@ def analyze_dockerfile(body: str) -> Analysis:
 from typing import Dict, List, Optional, Any
 
 class Analysis:
+    """Analysis of one Dockerfile.
+
+    ``args``, ``labels``, ``env_vars``, and ``exposed_ports`` are merged across
+    all stages (``args`` also includes global ``ARG``s before the first
+    ``FROM``); a later stage's value for a key replaces an earlier one. Use
+    ``stages`` for the values each stage sets. ``final_stage`` is the last
+    stage's name (None when unnamed); ``final_stage_info`` is the last
+    ``Stage`` object, or None when there are no stages.
+    """
+
     num_stages: int
     images: List[Image]
     stage_names: List[str]
@@ -46,6 +61,33 @@ class Analysis:
     args: Dict[str, Optional[str]]
     labels: Dict[str, str]
     env_vars: Dict[str, str]
+    stages: List[Stage]
+
+    @property
+    def final_stage_info(self) -> Optional[Stage]: ...
+    def to_dict(self) -> Dict[str, Any]: ...
+    def __repr__(self) -> str: ...
+
+class Stage:
+    """One build stage, from its ``FROM`` line to the next ``FROM``.
+
+    Values are the stage's own. Nothing is inherited from a parent stage, and
+    global ``ARG``s declared before the first ``FROM`` are not attributed to
+    any stage. ``parent_stage`` is set only when ``FROM`` names an earlier
+    stage; a later or unknown name is treated as an image.
+    """
+
+    index: int
+    name: Optional[str]
+    base_image: str
+    parent_stage: Optional[str]
+    platform: Optional[str]
+    args: Dict[str, Optional[str]]
+    env_vars: Dict[str, str]
+    labels: Dict[str, str]
+    exposed_ports: List[str]
+    user: Optional[str]
+    workdir: Optional[str]
 
     def to_dict(self) -> Dict[str, Any]: ...
     def __repr__(self) -> str: ...

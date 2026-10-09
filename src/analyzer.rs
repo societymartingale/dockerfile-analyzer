@@ -24,6 +24,8 @@ struct InstructionFacts {
     args: BTreeMap<String, Option<String>>,
     labels: BTreeMap<String, String>,
     env_vars: BTreeMap<String, String>,
+    user: Option<String>,
+    workdir: Option<String>,
 }
 
 enum FromTarget {
@@ -35,7 +37,12 @@ pub fn analyze_dockerfile(body: &str) -> Result<models::Analysis, Box<dyn Error>
     let dockerfile = parse(body)?;
     let stages: Vec<_> = dockerfile.stages().collect();
     let stage_info = extract_stage_info(&stages);
-    let facts = collect_instructions(&dockerfile.instructions, &stage_info.ordered_names);
+    let facts = collect_instructions(&dockerfile.instructions, &stage_info.ordered_names, true);
+    let stage_details = stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| build_stage(index, stage, &stage_info.ordered_names))
+        .collect();
     let multistage_analysis = analyze_multistage(
         stages.len(),
         &stage_info.images,
@@ -62,7 +69,41 @@ pub fn analyze_dockerfile(body: &str) -> Result<models::Analysis, Box<dyn Error>
         args: facts.args,
         labels: facts.labels,
         env_vars: facts.env_vars,
+        stages: stage_details,
     })
+}
+
+/// Describe one stage using only the instructions inside it.
+///
+/// The `FROM` instruction is not part of `stage.instructions`, so global
+/// `ARG`s before the first `FROM` never land in stage 0.
+fn build_stage(index: usize, stage: &Stage, ordered_names: &[Option<String>]) -> models::Stage {
+    let facts = collect_instructions(stage.instructions, ordered_names, false);
+    let base_image = normalize_image_ref(&stage.from.image.value);
+    let parent_stage = earlier_stage_named(&base_image, &ordered_names[..index]);
+    models::Stage {
+        index,
+        name: ordered_names[index].clone(),
+        base_image,
+        parent_stage,
+        platform: flag_value(&stage.from.options, constants::PLATFORM),
+        args: facts.args,
+        env_vars: facts.env_vars,
+        labels: facts.labels,
+        exposed_ports: facts.exposed_ports.into_iter().collect(),
+        user: facts.user,
+        workdir: facts.workdir,
+    }
+}
+
+/// Docker resolves a `FROM` name against earlier stages only. A name defined
+/// later, or not at all, is an image reference.
+fn earlier_stage_named(image: &str, earlier_names: &[Option<String>]) -> Option<String> {
+    earlier_names
+        .iter()
+        .flatten()
+        .find(|name| name.as_str() == image)
+        .cloned()
 }
 
 fn analyze_multistage(
@@ -125,6 +166,7 @@ fn extract_stage_info(stages: &[Stage]) -> StageInfo {
 fn collect_instructions(
     instructions: &[Instruction],
     ordered_stage_names: &[Option<String>],
+    preserve_arg_defaults: bool,
 ) -> InstructionFacts {
     let mut facts = InstructionFacts {
         copy_from_stages: BTreeSet::new(),
@@ -137,6 +179,8 @@ fn collect_instructions(
         args: BTreeMap::new(),
         labels: BTreeMap::new(),
         env_vars: BTreeMap::new(),
+        user: None,
+        workdir: None,
     };
 
     for instruction in instructions {
@@ -146,10 +190,14 @@ fn collect_instructions(
 
         match instruction {
             Instruction::Arg(arg) => {
-                parse_utils::merge_kv_pairs(
-                    &mut facts.args,
-                    parse_utils::parse_kv_pairs(arg.arguments.value.as_ref(), false),
-                );
+                let pairs = parse_utils::parse_kv_pairs(arg.arguments.value.as_ref(), false);
+                if preserve_arg_defaults {
+                    // A later stage's bare `ARG NAME` redeclares a global default.
+                    parse_utils::merge_kv_pairs(&mut facts.args, pairs);
+                } else {
+                    // Inside one stage, a later bare `ARG NAME` clears the default.
+                    facts.args.extend(pairs);
+                }
             }
             Instruction::Env(env) => {
                 insert_required_values(
@@ -167,6 +215,12 @@ fn collect_instructions(
                 facts
                     .exposed_ports
                     .extend(expose.arguments.iter().map(|port| port.value.to_string()));
+            }
+            Instruction::User(user) => {
+                facts.user = Some(user.arguments.value.to_string());
+            }
+            Instruction::Workdir(workdir) => {
+                facts.workdir = Some(workdir.arguments.value.to_string());
             }
             Instruction::Copy(copy) => {
                 record_from_flag(
@@ -206,7 +260,7 @@ fn record_from_flag(
     stages: &mut BTreeSet<String>,
     images: &mut BTreeMap<String, models::Image>,
 ) {
-    let Some(raw) = from_flag_value(options) else {
+    let Some(raw) = flag_value(options, constants::FROM) else {
         return;
     };
     match resolve_from_target(&raw, ordered_stage_names) {
@@ -221,11 +275,11 @@ fn record_from_flag(
     }
 }
 
-fn from_flag_value(options: &[Flag]) -> Option<String> {
+fn flag_value(options: &[Flag], name: &str) -> Option<String> {
     options.iter().find_map(|flag| {
         flag.name
             .value
-            .eq_ignore_ascii_case(constants::FROM)
+            .eq_ignore_ascii_case(name)
             .then(|| flag.value.as_ref().map(|value| value.value.to_string()))
             .flatten()
     })
@@ -446,6 +500,31 @@ mod tests {
         }
     }
 
+    fn stage(
+        index: usize,
+        name: Option<&str>,
+        base_image: &str,
+        parent_stage: Option<&str>,
+    ) -> models::Stage {
+        models::Stage {
+            index,
+            name: name.map(str::to_string),
+            base_image: base_image.to_string(),
+            parent_stage: parent_stage.map(str::to_string),
+            platform: None,
+            args: BTreeMap::new(),
+            env_vars: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            exposed_ports: vec![],
+            user: None,
+            workdir: None,
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
     #[test]
     fn test_multistage() {
         let dockerfile = r#"
@@ -557,6 +636,46 @@ CMD ["uvicorn", "--host", "0.0.0.0", "--port", "5000", "app.main:app"]"#;
             args,
             labels,
             env_vars,
+            stages: vec![
+                models::Stage {
+                    labels: BTreeMap::from([
+                        ("org.opencontainers.image.title".into(), "My App".into()),
+                        ("org.opencontainers.image.version".into(), "1.0".into()),
+                        (
+                            "org.opencontainers.image.authors".into(),
+                            "john@example.com".into(),
+                        ),
+                    ]),
+                    env_vars: BTreeMap::from([
+                        ("PYTHONPATH".into(), "/src".into()),
+                        ("PYTHONUNBUFFERED".into(), "1".into()),
+                        (
+                            "REQUESTS_CA_BUNDLE".into(),
+                            "/etc/ssl/certs/ca-certificates.crt".into(),
+                        ),
+                        ("PATH".into(), "/home/appuser/.local/bin:$PATH".into()),
+                    ]),
+                    workdir: Some("/src".into()),
+                    user: Some("root:root".into()),
+                    ..stage(
+                        0,
+                        Some("base"),
+                        "docker.abc.com/base-images/python:3.13-debian@sha256:55f1d15ef4c37870e23c03e89ad238940b55c8ede9f13fac4b7d71c7955f1053",
+                        None,
+                    )
+                },
+                models::Stage {
+                    user: Some("1000:1000".into()),
+                    ..stage(1, Some("test"), "base", Some("base"))
+                },
+                models::Stage {
+                    user: Some("1000:1000".into()),
+                    args: BTreeMap::from([("GIT_COMMIT".into(), None)]),
+                    env_vars: BTreeMap::from([("GIT_COMMIT".into(), "$GIT_COMMIT".into())]),
+                    exposed_ports: strings(&["5000"]),
+                    ..stage(2, None, "base", Some("base"))
+                },
+            ],
         };
 
         let res = analyze_dockerfile(dockerfile);
@@ -645,6 +764,13 @@ CMD ["npm", "start"]
             args: BTreeMap::new(),
             labels: BTreeMap::new(),
             env_vars: BTreeMap::from([("NODE_ENV".into(), "production".into())]),
+            stages: vec![models::Stage {
+                workdir: Some("/app".into()),
+                user: Some("nextjs".into()),
+                exposed_ports: strings(&["3000"]),
+                env_vars: BTreeMap::from([("NODE_ENV".into(), "production".into())]),
+                ..stage(0, None, "node:20-alpine", None)
+            }],
         };
         let res = analyze_dockerfile(dockerfile);
         assert!(res.is_ok());
@@ -765,6 +891,26 @@ CMD ["node", "server.js"]
             args: BTreeMap::new(),
             labels: BTreeMap::new(),
             env_vars: BTreeMap::new(),
+            stages: vec![
+                models::Stage {
+                    workdir: Some("/app".into()),
+                    ..stage(0, Some("dependencies"), "node:20-alpine", None)
+                },
+                models::Stage {
+                    workdir: Some("/app".into()),
+                    ..stage(1, Some("builder"), "node:20-alpine", None)
+                },
+                models::Stage {
+                    workdir: Some("/configs".into()),
+                    ..stage(2, Some("config-builder"), "alpine:3.18", None)
+                },
+                models::Stage {
+                    workdir: Some("/app".into()),
+                    user: Some("nextjs".into()),
+                    exposed_ports: strings(&["8080"]),
+                    ..stage(3, Some("production"), "node:20-alpine", None)
+                },
+            ],
         };
         let res = analyze_dockerfile(dockerfile);
         assert!(res.is_ok());
@@ -868,6 +1014,26 @@ CMD ["./app"]
             args: BTreeMap::new(),
             labels: BTreeMap::new(),
             env_vars: BTreeMap::new(),
+            stages: vec![
+                models::Stage {
+                    workdir: Some("/downloads".into()),
+                    ..stage(0, Some("downloader"), "alpine:3.18", None)
+                },
+                models::Stage {
+                    workdir: Some("/src".into()),
+                    ..stage(1, Some("go-builder"), "golang:1.21-alpine", None)
+                },
+                models::Stage {
+                    workdir: Some("/certs".into()),
+                    ..stage(2, Some("cert-generator"), "alpine:3.18", None)
+                },
+                models::Stage {
+                    workdir: Some("/app".into()),
+                    user: Some("appuser".into()),
+                    exposed_ports: strings(&["8080", "8443"]),
+                    ..stage(3, None, "alpine:3.18", None)
+                },
+            ],
         };
         let res = analyze_dockerfile(dockerfile);
         assert!(res.is_ok());
@@ -1114,5 +1280,224 @@ FROM ${REG}/library/ubuntu:${TAG:-22.04} AS build
         ));
         assert!(!rendered.contains("components=\"ImageComponents"));
         assert!(!rendered.contains("Some("));
+    }
+
+    #[test]
+    fn test_stage_parent_resolves_only_earlier_stages() {
+        let dockerfile = r#"
+FROM alpine:3.20 AS Base
+FROM base AS child
+FROM later AS early
+FROM node:20 AS later
+FROM unknown-image
+FROM child
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(
+            analysis.stages,
+            vec![
+                stage(0, Some("base"), "alpine:3.20", None),
+                stage(1, Some("child"), "base", Some("base")),
+                // `later` is defined after this stage, so it is an image.
+                stage(2, Some("early"), "later", None),
+                stage(3, Some("later"), "node:20", None),
+                stage(4, None, "unknown-image", None),
+                stage(5, None, "child", Some("child")),
+            ]
+        );
+        assert_eq!(analysis.num_stages, analysis.stages.len());
+    }
+
+    #[test]
+    fn test_stage_platform() {
+        let dockerfile = r#"
+FROM --platform=$BUILDPLATFORM golang:1.22 AS build
+FROM --platform=linux/amd64 alpine:3.20 AS runtime
+FROM scratch
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        let platforms: Vec<_> = analysis
+            .stages
+            .iter()
+            .map(|stage| stage.platform.clone())
+            .collect();
+        assert_eq!(
+            platforms,
+            vec![
+                Some("$BUILDPLATFORM".to_string()),
+                Some("linux/amd64".to_string()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stage_scoped_values_and_merged_top_level() {
+        let dockerfile = r#"
+FROM golang:1.22 AS build
+ARG TARGETOS=linux
+ENV CGO_ENABLED=0 MODE=build
+LABEL stage="build"
+EXPOSE 6060
+WORKDIR /src
+USER builder
+WORKDIR /src/cmd
+
+FROM alpine:3.20
+ARG TARGETOS
+ENV MODE=runtime
+LABEL stage="runtime" org.opencontainers.image.title="app"
+EXPOSE 8080/tcp 9090/udp
+USER root
+USER 65532:65532
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        let build = &analysis.stages[0];
+        let runtime = &analysis.stages[1];
+
+        assert_eq!(
+            build.args,
+            BTreeMap::from([("TARGETOS".into(), Some("linux".into()))])
+        );
+        assert_eq!(
+            build.env_vars,
+            BTreeMap::from([
+                ("CGO_ENABLED".into(), "0".into()),
+                ("MODE".into(), "build".into()),
+            ])
+        );
+        assert_eq!(
+            build.labels,
+            BTreeMap::from([("stage".into(), "build".into())])
+        );
+        assert_eq!(build.exposed_ports, strings(&["6060"]));
+        assert_eq!(build.user.as_deref(), Some("builder"));
+        assert_eq!(build.workdir.as_deref(), Some("/src/cmd"));
+
+        assert_eq!(runtime.args, BTreeMap::from([("TARGETOS".into(), None)]));
+        assert_eq!(
+            runtime.env_vars,
+            BTreeMap::from([("MODE".into(), "runtime".into())])
+        );
+        assert_eq!(
+            runtime.labels,
+            BTreeMap::from([
+                ("org.opencontainers.image.title".into(), "app".into()),
+                ("stage".into(), "runtime".into()),
+            ])
+        );
+        assert_eq!(runtime.exposed_ports, strings(&["8080/tcp", "9090/udp"]));
+        assert_eq!(runtime.user.as_deref(), Some("65532:65532"));
+        assert_eq!(runtime.workdir, None);
+
+        // Top-level values stay merged across stages.
+        assert_eq!(
+            analysis.args,
+            BTreeMap::from([("TARGETOS".into(), Some("linux".into()))])
+        );
+        assert_eq!(
+            analysis.env_vars,
+            BTreeMap::from([
+                ("CGO_ENABLED".into(), "0".into()),
+                ("MODE".into(), "runtime".into()),
+            ])
+        );
+        assert_eq!(
+            analysis.labels,
+            BTreeMap::from([
+                ("org.opencontainers.image.title".into(), "app".into()),
+                ("stage".into(), "runtime".into()),
+            ])
+        );
+        assert_eq!(
+            analysis.exposed_ports,
+            strings(&["6060", "8080/tcp", "9090/udp"])
+        );
+    }
+
+    #[test]
+    fn test_global_args_are_not_attributed_to_first_stage() {
+        let dockerfile = r#"
+ARG VERSION=1
+ARG REGISTRY=docker.io
+FROM ${REGISTRY}/alpine:${VERSION} AS base
+RUN true
+
+FROM base
+ARG VERSION
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert!(analysis.stages[0].args.is_empty());
+        assert_eq!(
+            analysis.stages[0].base_image,
+            "${REGISTRY}/alpine:${VERSION}"
+        );
+        assert_eq!(
+            analysis.stages[1].args,
+            BTreeMap::from([("VERSION".into(), None)])
+        );
+        assert_eq!(
+            analysis.args,
+            BTreeMap::from([
+                ("REGISTRY".into(), Some("docker.io".into())),
+                ("VERSION".into(), Some("1".into())),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_final_stage_info_is_last_stage() {
+        let dockerfile = r#"
+FROM golang:1.22 AS build
+FROM build AS release
+USER app
+"#;
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(analysis.final_stage, Some("release".to_string()));
+        assert_eq!(
+            analysis.final_stage_info(),
+            Some(models::Stage {
+                user: Some("app".into()),
+                ..stage(1, Some("release"), "build", Some("build"))
+            })
+        );
+
+        let unnamed = analyze_dockerfile("FROM alpine AS a\nFROM scratch\n").unwrap();
+        assert_eq!(unnamed.final_stage, None);
+        assert_eq!(
+            unnamed.final_stage_info(),
+            Some(stage(1, None, "scratch", None))
+        );
+    }
+
+    #[test]
+    fn test_final_stage_info_without_stages_is_none() {
+        let mut analysis = analyze_dockerfile("FROM alpine\n").unwrap();
+        analysis.stages.clear();
+        assert_eq!(analysis.final_stage_info(), None);
+    }
+
+    #[test]
+    fn test_bare_arg_in_same_stage_clears_default() {
+        let dockerfile = "FROM alpine\nARG VERSION=1\nARG VERSION\n";
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(
+            analysis.stages[0].args,
+            BTreeMap::from([("VERSION".into(), None)])
+        );
+        assert_eq!(
+            analysis.args,
+            BTreeMap::from([("VERSION".into(), Some("1".into()))])
+        );
+    }
+
+    #[test]
+    fn test_stage_repr_uses_python_none() {
+        let analysis = analyze_dockerfile("FROM alpine\nARG VERSION\n").unwrap();
+        assert_eq!(
+            analysis.stages[0].repr(),
+            "Stage(index=0, name=None, base_image=\"alpine\", parent_stage=None, platform=None, args={\"VERSION\": None}, env_vars={}, labels={}, exposed_ports=[], user=None, workdir=None)"
+        );
+        assert!(!analysis.repr().contains("Stage("));
     }
 }
