@@ -30,7 +30,7 @@ jobs:
           # Keep in sync with requires-python in pyproject.toml (PyO3 needs a
           # matching libpython for clippy on --all-targets).
           python-version: "3.14"
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           # A commit pin does not get the branch-name default of stable.
           toolchain: stable
@@ -54,7 +54,7 @@ jobs:
           # Keep in sync with requires-python in pyproject.toml (PyO3 needs a
           # matching libpython for linking the test binary).
           python-version: "3.14"
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           # A commit pin does not get the branch-name default of stable.
           toolchain: stable
@@ -74,7 +74,7 @@ jobs:
         with:
           # Keep in sync with requires-python in pyproject.toml.
           python-version: "3.14"
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           # A commit pin does not get the branch-name default of stable.
           toolchain: stable
