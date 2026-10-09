@@ -11,6 +11,7 @@ pub const HEALTHCHECK: &str = "HEALTHCHECK";
 pub const LABEL: &str = "LABEL";
 pub const MAINTAINER: &str = "MAINTAINER";
 pub const ONBUILD: &str = "ONBUILD";
+pub const PLATFORM: &str = "platform";
 pub const RUN: &str = "RUN";
 pub const SHELL: &str = "SHELL";
 pub const STOPSIGNAL: &str = "STOPSIGNAL";
