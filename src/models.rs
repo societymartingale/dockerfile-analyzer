@@ -182,6 +182,98 @@ impl MultistageAnalysis {
 }
 
 #[pyclass(skip_from_py_object)]
+#[doc = "One build stage, from its `FROM` line to the next `FROM`.
+
+Values are the stage's own, as written in that stage. Nothing is inherited
+from a parent stage, and global `ARG`s declared before the first `FROM` are
+not attributed to any stage.
+
+Attributes:
+    index (int): Zero-based position of the stage in the Dockerfile.
+    name (str | None): The lowercased `AS` name, or None when unnamed.
+    base_image (str): The `FROM` reference. It is lowercased unless it
+        contains `$`, matching `Analysis.images`.
+    parent_stage (str | None): The name of the earlier stage this `FROM`
+        builds on, or None. Only earlier stages are matched, as in Docker; a
+        name defined later, or any other name, is treated as an image.
+    platform (str | None): The `--platform` value as written, or None.
+    args (dict[str, str | None]): `ARG`s declared in this stage. A
+        redeclaration without a default is None here.
+    env_vars (dict[str, str]): `ENV` values set in this stage.
+    labels (dict[str, str]): `LABEL` values set in this stage.
+    exposed_ports (list[str]): `EXPOSE` tokens in this stage, sorted.
+    user (str | None): The last `USER` in this stage, or None.
+    workdir (str | None): The last `WORKDIR` in this stage, or None.
+"]
+#[derive(Debug, PartialEq, Clone)]
+pub struct Stage {
+    #[pyo3(get)]
+    pub index: usize,
+    #[pyo3(get)]
+    pub name: Option<String>,
+    #[pyo3(get)]
+    pub base_image: String,
+    #[pyo3(get)]
+    pub parent_stage: Option<String>,
+    #[pyo3(get)]
+    pub platform: Option<String>,
+    #[pyo3(get)]
+    pub args: BTreeMap<String, Option<String>>,
+    #[pyo3(get)]
+    pub env_vars: BTreeMap<String, String>,
+    #[pyo3(get)]
+    pub labels: BTreeMap<String, String>,
+    #[pyo3(get)]
+    pub exposed_ports: Vec<String>,
+    #[pyo3(get)]
+    pub user: Option<String>,
+    #[pyo3(get)]
+    pub workdir: Option<String>,
+}
+
+impl Stage {
+    pub fn repr(&self) -> String {
+        self.__repr__()
+    }
+}
+
+#[pymethods]
+impl Stage {
+    fn __repr__(&self) -> String {
+        format!(
+            "Stage(index={}, name={}, base_image={:?}, parent_stage={}, platform={}, args={}, env_vars={:?}, labels={:?}, exposed_ports={:?}, user={}, workdir={})",
+            self.index,
+            fmt_opt(&self.name),
+            self.base_image,
+            fmt_opt(&self.parent_stage),
+            fmt_opt(&self.platform),
+            fmt_opt_map(&self.args),
+            self.env_vars,
+            self.labels,
+            self.exposed_ports,
+            fmt_opt(&self.user),
+            fmt_opt(&self.workdir)
+        )
+    }
+
+    fn to_dict(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let dict = PyDict::new(py);
+        dict.set_item("index", self.index)?;
+        dict.set_item("name", &self.name)?;
+        dict.set_item("base_image", &self.base_image)?;
+        dict.set_item("parent_stage", &self.parent_stage)?;
+        dict.set_item("platform", &self.platform)?;
+        dict.set_item("args", &self.args)?;
+        dict.set_item("env_vars", &self.env_vars)?;
+        dict.set_item("labels", &self.labels)?;
+        dict.set_item("exposed_ports", &self.exposed_ports)?;
+        dict.set_item("user", &self.user)?;
+        dict.set_item("workdir", &self.workdir)?;
+        Ok(dict.into())
+    }
+}
+
+#[pyclass(skip_from_py_object)]
 #[doc = "Analysis of one Dockerfile.
 
 Image references that do not contain `$` are lowercased, so `Ubuntu:22.04`
@@ -199,6 +291,13 @@ in-range index of an unnamed stage, the index is reported in place of a name.
 images are `copy_from_images` and `add_from_images`. A `--from` value that
 names a stage, or an in-range stage index, is a stage reference rather than
 an image.
+
+`args`, `labels`, `env_vars`, and `exposed_ports` are merged across all
+stages (and, for `args`, global `ARG`s before the first `FROM`); a later
+stage's value for a key replaces an earlier one. Use `stages` for the values
+each stage sets. `stages` lists every stage in Dockerfile order.
+`final_stage_info` is the last `Stage`, or None when there are no stages;
+`final_stage` keeps returning only the last stage's name.
 "]
 #[derive(Debug, PartialEq, Clone)]
 pub struct Analysis {
@@ -230,6 +329,8 @@ pub struct Analysis {
     pub labels: BTreeMap<String, String>,
     #[pyo3(get)]
     pub env_vars: BTreeMap<String, String>,
+    #[pyo3(get)]
+    pub stages: Vec<Stage>,
 }
 
 impl Analysis {
@@ -240,6 +341,12 @@ impl Analysis {
 
 #[pymethods]
 impl Analysis {
+    /// The last stage, or None when the Dockerfile has no stages.
+    #[getter]
+    pub fn final_stage_info(&self) -> Option<Stage> {
+        self.stages.last().cloned()
+    }
+
     fn __repr__(&self) -> String {
         let images = join_images(&self.images);
         let copy_from_images = join_images(&self.copy_from_images);
@@ -282,6 +389,12 @@ impl Analysis {
         dict.set_item("args", &self.args)?;
         dict.set_item("labels", &self.labels)?;
         dict.set_item("env_vars", &self.env_vars)?;
+        let stages = self
+            .stages
+            .iter()
+            .map(|stage| stage.to_dict(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        dict.set_item("stages", stages)?;
         Ok(dict.into())
     }
 }
