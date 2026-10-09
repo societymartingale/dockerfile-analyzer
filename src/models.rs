@@ -341,7 +341,6 @@ impl Analysis {
 
 #[pymethods]
 impl Analysis {
-    /// The last stage, or None when the Dockerfile has no stages.
     #[getter]
     pub fn final_stage_info(&self) -> Option<Stage> {
         self.stages.last().cloned()
