@@ -139,6 +139,12 @@ ARG VERSION
     assert analysis.args == {"VERSION": "1"}
 
 
+def test_bare_arg_in_same_stage_clears_default():
+    analysis = da.analyze_dockerfile("FROM alpine\nARG VERSION=1\nARG VERSION\n")
+    assert analysis.stages[0].args == {"VERSION": None}
+    assert analysis.args == {"VERSION": "1"}
+
+
 def test_final_stage_info_and_final_stage_name():
     analysis = da.analyze_dockerfile("FROM golang:1.22 AS build\nFROM build AS release\n")
     assert analysis.final_stage == "release"

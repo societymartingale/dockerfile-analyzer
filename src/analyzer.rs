@@ -24,9 +24,7 @@ struct InstructionFacts {
     args: BTreeMap<String, Option<String>>,
     labels: BTreeMap<String, String>,
     env_vars: BTreeMap<String, String>,
-    /// Last `USER` value seen, if any.
     user: Option<String>,
-    /// Last `WORKDIR` value seen, if any.
     workdir: Option<String>,
 }
 
@@ -39,7 +37,7 @@ pub fn analyze_dockerfile(body: &str) -> Result<models::Analysis, Box<dyn Error>
     let dockerfile = parse(body)?;
     let stages: Vec<_> = dockerfile.stages().collect();
     let stage_info = extract_stage_info(&stages);
-    let facts = collect_instructions(&dockerfile.instructions, &stage_info.ordered_names);
+    let facts = collect_instructions(&dockerfile.instructions, &stage_info.ordered_names, true);
     let stage_details = stages
         .iter()
         .enumerate()
@@ -80,7 +78,7 @@ pub fn analyze_dockerfile(body: &str) -> Result<models::Analysis, Box<dyn Error>
 /// The `FROM` instruction is not part of `stage.instructions`, so global
 /// `ARG`s before the first `FROM` never land in stage 0.
 fn build_stage(index: usize, stage: &Stage, ordered_names: &[Option<String>]) -> models::Stage {
-    let facts = collect_instructions(stage.instructions, ordered_names);
+    let facts = collect_instructions(stage.instructions, ordered_names, false);
     let base_image = normalize_image_ref(&stage.from.image.value);
     let parent_stage = earlier_stage_named(&base_image, &ordered_names[..index]);
     models::Stage {
@@ -168,6 +166,7 @@ fn extract_stage_info(stages: &[Stage]) -> StageInfo {
 fn collect_instructions(
     instructions: &[Instruction],
     ordered_stage_names: &[Option<String>],
+    preserve_arg_defaults: bool,
 ) -> InstructionFacts {
     let mut facts = InstructionFacts {
         copy_from_stages: BTreeSet::new(),
@@ -191,10 +190,14 @@ fn collect_instructions(
 
         match instruction {
             Instruction::Arg(arg) => {
-                parse_utils::merge_kv_pairs(
-                    &mut facts.args,
-                    parse_utils::parse_kv_pairs(arg.arguments.value.as_ref(), false),
-                );
+                let pairs = parse_utils::parse_kv_pairs(arg.arguments.value.as_ref(), false);
+                if preserve_arg_defaults {
+                    // A later stage's bare `ARG NAME` redeclares a global default.
+                    parse_utils::merge_kv_pairs(&mut facts.args, pairs);
+                } else {
+                    // Inside one stage, a later bare `ARG NAME` clears the default.
+                    facts.args.extend(pairs);
+                }
             }
             Instruction::Env(env) => {
                 insert_required_values(
@@ -1472,6 +1475,20 @@ USER app
         let mut analysis = analyze_dockerfile("FROM alpine\n").unwrap();
         analysis.stages.clear();
         assert_eq!(analysis.final_stage_info(), None);
+    }
+
+    #[test]
+    fn test_bare_arg_in_same_stage_clears_default() {
+        let dockerfile = "FROM alpine\nARG VERSION=1\nARG VERSION\n";
+        let analysis = analyze_dockerfile(dockerfile).unwrap();
+        assert_eq!(
+            analysis.stages[0].args,
+            BTreeMap::from([("VERSION".into(), None)])
+        );
+        assert_eq!(
+            analysis.args,
+            BTreeMap::from([("VERSION".into(), Some("1".into()))])
+        );
     }
 
     #[test]
