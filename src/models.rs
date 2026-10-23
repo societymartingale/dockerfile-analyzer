@@ -18,7 +18,7 @@ fn fmt_opt_map(map: &BTreeMap<String, Option<String>>) -> String {
     format!("{{{body}}}")
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[doc = "Instructions and their counts.
 
 Counts are keyed by the Dockerfile instruction name (`FROM`, `RUN`, ...).
@@ -50,7 +50,7 @@ impl InstructionStats {
     }
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[doc = "Parsed components of a Docker image reference.
 
 Attributes:
@@ -93,7 +93,7 @@ impl ImageComponents {
     }
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[doc = "Information about a Docker image used in a Dockerfile.
 
 Attributes:
@@ -131,7 +131,7 @@ impl Image {
     }
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[doc = "How named stages are referenced by later instructions.
 
 `is_multistage` is true when the Dockerfile has at least two stages and a
@@ -181,7 +181,7 @@ impl MultistageAnalysis {
     }
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[doc = "One build stage, from its `FROM` line to the next `FROM`.
 
 Values are the stage's own, as written in that stage. Nothing is inherited
@@ -273,7 +273,7 @@ impl Stage {
     }
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[doc = "Analysis of one Dockerfile.
 
 Image references that do not contain `$` are lowercased, so `Ubuntu:22.04`
