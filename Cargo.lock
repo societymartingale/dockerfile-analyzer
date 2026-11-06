@@ -48,9 +48,9 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "parse-dockerfile"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6bf36e89d16b0fcc540dfe420c99d692c703c436f1ea605195bc0a95651d69e"
+checksum = "3d1a04a7f4bc081ef4f89e9921ba32a7f524f41270019b81c8099e24f23be0c6"
 dependencies = [
  "smallvec",
 ]
